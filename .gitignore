@@ -31,3 +31,11 @@ desktop.ini
 
 # --- Scraper: midlertidige filer ---
 *.json.tmp
+
+# --- Scraper: testdata / lokal kjøring (ikke kode) ---
+**/output/*.json
+**/*_dump/**/*.json
+**/running_daily/**/state.json
+**/running_daily/**/run.log
+**/running_daily/**/seen_journalpost_ids.json
+**/running_daily/**/snapshot.json
