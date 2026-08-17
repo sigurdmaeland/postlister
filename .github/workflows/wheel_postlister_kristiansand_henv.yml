@@ -1,0 +1,18 @@
+name: Postlister Bronze Kristiansand Henv
+
+on:
+  push:
+    branches: [ "master" ]
+    paths:
+      - "bronze/postlister/opengov/kristiansand/running_daily/henv/setup.py"
+  workflow_dispatch:
+
+jobs:
+  build-and-upload-wheel:
+    uses: ./.github/workflows/build_upload_wheel.yml
+    with:
+      package_dir: "bronze/postlister/opengov/kristiansand/running_daily/henv"
+      package_name: "kristiansand-henv"
+      python_version: "3.11"
+      blob_prefix: "postlister/bronze/wheels"
+    secrets: inherit

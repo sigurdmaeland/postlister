@@ -44,6 +44,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -693,6 +694,47 @@ def save_state(state, state_file):
     tmp = state_file.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(state_file)
+
+
+def build_state_from_dump(dump_files, today_fn=None):
+    """Seeder seen_saker/seen_journalposter fra én eller flere ferdige
+    historiske dump-filer, slik at run_daily() ikke feilaktig flagger
+    allerede-dumpede saker som "nye" ved (eller etter) første kjøring. Se
+    Oslo sin scraper_lib.py (samme eInnsyn-mekanisme) for full forklaring.
+
+    dump_files: én filsti eller en liste. Støtter både vanlig JSON-liste
+    (.json) og linje-separert JSON (.jsonl, sjekkpunktfil fra en pågående
+    dump)."""
+    today_fn = today_fn or (lambda: datetime.now(ZoneInfo("Europe/Oslo")).date())
+    i_dag = today_fn().isoformat()
+    seen_saker, seen_jp = {}, {}
+    paths = dump_files if isinstance(dump_files, (list, tuple)) else [dump_files]
+    for p in paths:
+        p = Path(p)
+        if p.suffix == ".jsonl":
+            records = [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
+        else:
+            records = json.loads(p.read_text(encoding="utf-8"))
+        for r in records:
+            if not r.get("identifier"):
+                continue
+            seen_saker[r["identifier"]] = i_dag
+            for jp in r.get("journalposter") or []:
+                if jp.get("identifier"):
+                    seen_jp[jp["identifier"]] = i_dag
+    return {"seen_saker": seen_saker, "seen_journalposter": seen_jp}
+
+
+def merge_state_from_dump(dump_files, state_file, today_fn=None):
+    """Slår build_state_from_dump() inn i et eksisterende (eller tomt)
+    state.json uten å tape last_success_date/nyere seen-oppføringer.
+    Trygt å kjøre flere ganger."""
+    state = load_state(state_file)
+    seed = build_state_from_dump(dump_files, today_fn=today_fn)
+    state["seen_saker"] = {**seed["seen_saker"], **state["seen_saker"]}
+    state["seen_journalposter"] = {**seed["seen_journalposter"], **state["seen_journalposter"]}
+    save_state(state, state_file)
+    return state
 
 
 def prune_seen(state, today, seen_retention_days=SEEN_RETENTION_DAYS):

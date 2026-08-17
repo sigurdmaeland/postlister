@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "postlister-kristiansand-henv-bronze"
+version = "0.1.0"
+description = "Bronze layer for Kristiansand HENVENDELSE postliste (running_daily)"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "azure-storage-blob>=12.19.0",
+    "azure-identity>=1.15.0",
+    "python-dotenv>=1.0.0"
+]
+
+[project.scripts]
+kristiansand-henv-trigger = "app.main:trigger"

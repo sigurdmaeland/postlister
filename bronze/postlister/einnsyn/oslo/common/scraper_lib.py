@@ -41,6 +41,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -134,6 +135,12 @@ _STREET_TYPES = [
     "grensen", "gård", "stien", "åsen", "gang", "gangen", "leir", "leiret",
     "hagan", "stubb", "stubben", "haugen", "naret", "kloa", "bølgen", "enga",
     "åsveien", "hellinga", "sletta",
+    # Lagt til etter funn i ekte Oslo-data (se _er_gyldig sin fallback for
+    # gatenavn uten NOEN kjent endelse, som dekker resten av dette problemet
+    # mer generelt - disse er likevel lagt til fordi de er ekte, gjenbrukbare
+    # gatetype-ord, ikke bare enkeltstående titler):
+    "aveny", "kroken", "stredet", "hagen", "skrenten", "høgda", "brygge",
+    "bryggen", "promenaden", "tråkket", "smutt", "smutten",
 ]
 
 _ORD_RE = re.compile(r"[a-zæøåéA-ZÆØÅÉ]+")
@@ -224,12 +231,40 @@ def _er_gyldig(kandidat):
     if any(lav.startswith(p) for p in _NO_ADDRESS_PATTERNS):
         return False
     ord_liste = _ORD_RE.findall(lav)
-    if not any(any(w.endswith(st) for st in _STREET_TYPES) for w in ord_liste):
-        return False
+    har_tall = bool(re.search(r"\d", kandidat))
+    har_gatetype = any(any(w.endswith(st) for st in _STREET_TYPES) for w in ord_liste)
+    if not har_gatetype:
+        # Ingen kjent gatetype-endelse (f.eks. "Stranden 15", "Torget 2") -
+        # _STREET_TYPES kan aldri bli komplett (nye/uvanlige gatenavn dukker
+        # stadig opp i ekte data), så godta likevel når kandidaten er kort
+        # (maks 2 "ordentlige" ord - ett egennavn, evt. et sammensatt), har et
+        # husnummer, OG starter med stor bokstav (ikke f.eks. et rent
+        # gnr/bnr-tall som "180/81, 180/113 og 180/126", som starter med et
+        # siffer). Enkeltbokstaver (fra "22A-B" o.l., der _ORD_RE splitter ut
+        # "a"/"b" som egne "ord" siden tallet mellom bryter dem) telles ikke
+        # som egne ord her.
+        ord_liste_reelle = [w for w in ord_liste if len(w) > 1]
+        # Ekskluder kandidater som egentlig er en SAKS-/SPØRSMÅLSREFERANSE, ikke
+        # et husnummer - f.eks. "Spørsmål 359/2026" (byrådsspørsmål) eller
+        # "Arendalsuka 2026" (arrangementsår). Kjennetegn: et "/"-tall (samme
+        # form som gnr/bnr, aldri reelt husnummer i denne tittelformen), ELLER
+        # et ENKELT tall som ligner et årstall (samme vindu som brukes i
+        # extract_gnr_bnr for å luke ut årstall der). Uten denne sjekken
+        # kapres extract_adresse av referansetallet FØR den når den faktiske
+        # adressen som ofte står i et senere segment av samme tittel.
+        tall_i_kandidat = re.findall(r"\d+", kandidat)
+        ser_ut_som_referanse = "/" in kandidat or (
+            len(tall_i_kandidat) == 1
+            and _GNR_BNR_AARSTALL_MIN <= int(tall_i_kandidat[0]) <= _GNR_BNR_AARSTALL_MAKS
+        )
+        if ser_ut_som_referanse or not (
+            har_tall and len(ord_liste_reelle) <= 2 and kandidat[:1].isalpha() and kandidat[:1].isupper()
+        ):
+            return False
     # Uten noe tall er kandidaten trolig et rent (kort) gatenavn - eller en
     # hel beskrivelse-setning som tilfeldigvis inneholder et gatenavn-liknende
     # ord et sted. Skiller på lengde.
-    if not re.search(r"\d", kandidat) and len(ord_liste) > 3:
+    if not har_tall and len(ord_liste) > 3:
         return False
     return True
 
@@ -246,8 +281,18 @@ def _er_gyldig(kandidat):
 #      bokstavspenn ("29A-29B", "76-86", "12A-C") holdes samlet som ETT
 #      element i begge varianter - se _HUSNR_TOKEN.
 _HUSNR_TOKEN = r"\d+[A-Za-zæøåÆØÅ]?(?:-(?:\d+[A-Za-zæøåÆØÅ]?|[A-Za-zæøåÆØÅ]))?"
+# Gatenavn-gruppen (\1) holdes til BOKSTAVER/punktum/bindestrek/mellomrom -
+# IKKE \w (som også matcher tall). Uten dette kan gruppen "sluke" et helt
+# tall+"og"+neste gatenavn som om det var ett langt gatenavn, f.eks.
+# "Bjørnefaret 4 og Grevlinglia 3" ville ellers matchet med gate="Bjørnefaret
+# 4 og Grevlinglia" og tall=["3"] - altså INGEN splitt, siden det (feilaktig)
+# tolkes som samme gate med ett tall. Med tall utelatt fra gate-gruppen
+# stopper den ved "4", " og Grevlinglia 3" kan ikke fullføre matchen (feil
+# gatenavn, ikke et rent tall/spenn), og regexen gir opp - _utvid_flere_adresser
+# faller da videre til variant 2 (egne gate+nr-par), som splitter korrekt til
+# "Bjørnefaret 4; Grevlinglia 3".
 _SAMME_GATE_LISTE_RE = re.compile(
-    rf"^([A-ZÆØÅ][\w.\- ]*?)\s+({_HUSNR_TOKEN})"
+    rf"^([A-ZÆØÅ][A-Za-zæøåÆØÅ.\- ]*?)\s+({_HUSNR_TOKEN})"
     rf"((?:\s*,\s*{_HUSNR_TOKEN})*)"
     rf"(?:\s+og\s+({_HUSNR_TOKEN}))?$"
 )
@@ -719,6 +764,59 @@ def save_state(state, state_file):
     tmp = state_file.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(state_file)
+
+
+def build_state_from_dump(dump_files, today_fn=None):
+    """Seeder seen_saker/seen_journalposter fra én eller flere ferdige
+    historiske dump-filer, slik at run_daily() ikke feilaktig flagger
+    allerede-dumpede saker som "nye" ved (eller etter) første kjøring. Uten
+    denne seedingen starter run_for_date() med tomme seen_saker/seen_jp, og
+    ALT innenfor det første datovinduet blir feilklassifisert som ny sak -
+    selv om saken allerede finnes i dumpen (bekreftet skjedd i praksis, se
+    run_daily-docstring).
+
+    dump_files: én filsti eller en liste. Støtter både vanlig JSON-liste
+    (.json, fra en fullført run_full_dump) og linje-separert JSON (.jsonl,
+    en gjenopptakbar sjekkpunktfil fra en PÅGÅENDE dump - se modul-
+    docstring). Bruk en sjekkpunktfil hvis den fulle dumpen ikke er ferdig
+    ennå; kjør denne funksjonen på nytt (den kan trygt kjøres flere ganger)
+    når den fulle dumpen er konsolidert.
+
+    Returnerer {"seen_saker": {...}, "seen_journalposter": {...}} - bruk
+    merge_state_from_dump() for å slå dette sammen med et eksisterende
+    state.json uten å tape allerede oppdatert last_success_date/state."""
+    today_fn = today_fn or (lambda: datetime.now(ZoneInfo("Europe/Oslo")).date())
+    i_dag = today_fn().isoformat()
+    seen_saker, seen_jp = {}, {}
+    paths = dump_files if isinstance(dump_files, (list, tuple)) else [dump_files]
+    for p in paths:
+        p = Path(p)
+        if p.suffix == ".jsonl":
+            records = [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
+        else:
+            records = json.loads(p.read_text(encoding="utf-8"))
+        for r in records:
+            if not r.get("identifier"):
+                continue
+            seen_saker[r["identifier"]] = i_dag
+            for jp in r.get("journalposter") or []:
+                if jp.get("identifier"):
+                    seen_jp[jp["identifier"]] = i_dag
+    return {"seen_saker": seen_saker, "seen_journalposter": seen_jp}
+
+
+def merge_state_from_dump(dump_files, state_file, today_fn=None):
+    """Slår build_state_from_dump() inn i et eksisterende (eller tomt)
+    state.json - dumpens funn fylles inn UNDER det som allerede er
+    sett/kjørt (last_success_date og nyere seen-oppføringer fra faktiske
+    run_daily-kjøringer overstyrer, ikke motsatt). Trygt å kjøre flere
+    ganger, f.eks. på nytt hver gang dumpen får mer historikk."""
+    state = load_state(state_file)
+    seed = build_state_from_dump(dump_files, today_fn=today_fn)
+    state["seen_saker"] = {**seed["seen_saker"], **state["seen_saker"]}
+    state["seen_journalposter"] = {**seed["seen_journalposter"], **state["seen_journalposter"]}
+    save_state(state, state_file)
+    return state
 
 
 def prune_seen(state, today, seen_retention_days=SEEN_RETENTION_DAYS):

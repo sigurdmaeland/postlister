@@ -849,6 +849,24 @@ def save_seen_ids(seen, keep_after_iso, seen_ids_file):
     seen_ids_file.write_text(json.dumps(pruned, ensure_ascii=False), encoding="utf-8")
 
 
+def seed_seen_ids_from_dump(dump_file, seen_ids_file):
+    """Seeder seen_journalpost_ids.json fra en ferdig historisk dump, slik
+    at run_daily() ikke feilaktig rapporterer journalposter som allerede
+    ligger i dumpen som "nye" - se Asker sin scraper_lib.py (samme
+    mekanisme) for full forklaring. Trygt å kjøre flere ganger."""
+    with open(dump_file, encoding="utf-8") as f:
+        saker = json.load(f)
+    seen = load_seen_ids(seen_ids_file)
+    fra_dump = {}
+    for sak in saker:
+        for jp in sak.get("journalposter") or []:
+            if jp.get("identifier"):
+                fra_dump[jp["identifier"]] = jp.get("dato")
+    merged = {**fra_dump, **seen}
+    seen_ids_file.write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
+    return merged
+
+
 def write_output(saker, ref_date, output_dir):
     output_dir.mkdir(exist_ok=True)
     (output_dir / f"saker_{ref_date}.json").write_text(

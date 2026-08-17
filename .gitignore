@@ -17,6 +17,7 @@ ENV/
 # --- Miljøvariabler / hemmeligheter ---
 .env
 .env.*
+!.env.example
 *.pem
 
 # --- Operativsystem ---
