@@ -232,19 +232,72 @@ KILDER = {
 
 
 # --------------------------------------------------------------------------- #
-# gnr/bnr/matrikkelnr - strukturert fra API-et (propertyIdentifications)
+# gnr/bnr/matrikkelnr - API-et (propertyIdentifications) + tittel-fallback
 # --------------------------------------------------------------------------- #
-def gnr_bnr_matrikkel(property_identifications):
-    """Dedupe (propertyNr, useNr)-par (de dubleres i lista) -> gnr_bnr + matrikkelnr."""
-    seen = []
+# Fanger gnr/bnr[/feste[/seksjon]] når tallkjeden innledes av tittel-start,
+# komma, bindestrek, åpningsparentes, eller "eiendom(men)"-henvisningen (se
+# _EIENDOM_PREFIX under - samme skrivefeilvariant "eieindom" dekkes her også)
+# - IKKE når det er en del av selve gateadressen (et gate-husnummerspenn som
+# "Fr.Langesgt. 19/21" har ALDRI et av disse skilletegnene/ordet foran seg,
+# ulikt ekte gnr/bnr-oppføringer - bekreftet ved stikkprøve mot Tromsø/Asker,
+# som deler samme kildeplattform og titteldialekt). gnr "0" er kildens
+# plassholder for "ingen egen eiendom" og utelates. Hele tallkjeden fanges
+# (ikke bare de første to) fordi et fåtall titler skriver kommunenummeret
+# FØRST i kjeden ("5001/177/821/0/0" = KOMMUNE_NR/gnr/bnr/feste/seksjon, ikke
+# gnr/bnr 5001/177 - bekreftet på ekte data, se _gnr_bnr_fra_tallkjede).
+_TITLE_GNR_BNR = re.compile(
+    r"(?:^|[,\-(]|\beie(?:i)?ndom(?:men)?\s*\(?)\s*(\d{1,4}(?:/\d{1,5}){1,3})",
+    re.IGNORECASE,
+)
+
+
+def _gnr_bnr_fra_tallkjede(tallkjede):
+    """Tolk en tallkjede "A/B[/C[/D]]" som gnr/bnr - hopper over en ledende
+    KOMMUNE_NR hvis kjeden starter med den (se _TITLE_GNR_BNR over)."""
+    nums = tallkjede.split("/")
+    if nums[0] == str(KOMMUNE_NR) and len(nums) >= 3:
+        return nums[1], nums[2]
+    return nums[0], nums[1]
+
+
+def gnr_bnr_fra_tittel(tittel):
+    """Finn ALLE gnr/bnr-par i sakstittelen (ledende matrikkelnr, restatert/
+    ekstra matrikkelnr i parentes, "eiendom(men) gnr/bnr"-henvisning, eller et
+    matrikkelnr som følger etter adressen). Brukt som fallback/tillegg til
+    propertyIdentifications i gnr_bnr_matrikkel()."""
+    if not tittel:
+        return []
+    pairs = []
+    for m in _TITLE_GNR_BNR.finditer(tittel):
+        gnr, bnr = _gnr_bnr_fra_tallkjede(m.group(1))
+        if gnr == "0":
+            continue
+        pair = f"{gnr}/{bnr}"
+        if pair not in pairs:
+            pairs.append(pair)
+    return pairs
+
+
+def gnr_bnr_matrikkel(property_identifications, tittel=None):
+    """Dedupe (propertyNr, useNr)-par (de dubleres i lista) fra API-et,
+    beriket additivt med gnr/bnr parset fra tittelen (se gnr_bnr_fra_tittel) -
+    både som fallback når API-et ikke gir noe, og som tillegg når tittelen
+    restaterer et EKSTRA gnr/bnr utover det API-et allerede oppgir."""
+    pairs = []
     for pid in property_identifications or []:
-        pair = (pid.get("propertyNr"), pid.get("useNr"))
-        if pair not in seen and pair[0] is not None and pair[1] is not None:
-            seen.append(pair)
-    if not seen:
+        gnr, bnr = pid.get("propertyNr"), pid.get("useNr")
+        if gnr is None or bnr is None:
+            continue
+        pair = f"{gnr}/{bnr}"
+        if pair not in pairs:
+            pairs.append(pair)
+    for pair in gnr_bnr_fra_tittel(tittel):
+        if pair not in pairs:
+            pairs.append(pair)
+    if not pairs:
         return None, None
-    gnr_bnr = "; ".join(f"{gnr}/{bnr}" for gnr, bnr in seen)
-    matrikkelnr = "; ".join(f"{KOMMUNE_NR}-{gnr}/{bnr}" for gnr, bnr in seen)
+    gnr_bnr = "; ".join(pairs)
+    matrikkelnr = "; ".join(f"{KOMMUNE_NR}-{p}" for p in pairs)
     return gnr_bnr, matrikkelnr
 
 
@@ -574,7 +627,9 @@ def build_journalpost(journal):
 
 
 def build_sak(proceeding, journalposter, type_id, sakstype):
-    gnr_bnr, matrikkelnr = gnr_bnr_matrikkel(proceeding.get("propertyIdentifications"))
+    gnr_bnr, matrikkelnr = gnr_bnr_matrikkel(
+        proceeding.get("propertyIdentifications"), proceeding.get("title")
+    )
     saksnummer = proceeding.get("sequenceNumber")
     return {
         "identifier": proceeding.get("id"),
@@ -601,9 +656,9 @@ def parent_sak_ref(session, type_id, journal_proceeding_stub):
     seq = journal_proceeding_stub.get("sequenceNumber")
     full = fetch_proceeding_by_sequence_number(session, type_id, seq) if seq else None
     data = full or journal_proceeding_stub
-    gnr_bnr, matrikkelnr = gnr_bnr_matrikkel(data.get("propertyIdentifications"))
-    saksnummer = data.get("sequenceNumber")
     tittel = data.get("title")
+    gnr_bnr, matrikkelnr = gnr_bnr_matrikkel(data.get("propertyIdentifications"), tittel)
+    saksnummer = data.get("sequenceNumber")
     return {
         "identifier": data.get("id"),
         "kommune": KOMMUNE,

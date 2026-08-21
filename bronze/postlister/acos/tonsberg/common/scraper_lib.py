@@ -250,22 +250,44 @@ def _finn_gnrbnr_blokk_lopende(segs):
 
 _HAS_DIGIT_RE = re.compile(r"\d")
 _NUM_LETTER_SPACE_RE = re.compile(r"(\d+)\s+([A-Za-zæøåÆØÅ])\b")
-_OG_PAIR_RE = re.compile(r"^(.+?)\s+(\d+[A-Za-zæøåÆØÅ]?)\s+og\s+(\d+[A-Za-zæøåÆØÅ]?)$",
-                         re.IGNORECASE)
 _SPACED_PAIR_RE = re.compile(r"^(.+?)\s+(\d+[A-Za-zæøåÆØÅ]?)\s+-\s+(\d+[A-Za-zæøåÆØÅ]?)$")
+# Generell N-veis husnummerliste på samme gate ("Åslyveien 3A, 3B, 3C, 3D,
+# 3E", "Rambergveien 37, 39 og 41", "Heimskringla 16 og 18") - dekker BÅDE
+# det enkle to-tall-"og"-paret OG lengre komma-lister, med eller uten et
+# avsluttende "og". En tidligere, snevrere to-talls-variant fanget kun de
+# to SISTE numrene i en lengre komma-liste og lot resten av lista bli
+# hengende igjen i gate-gruppen ("Åslyveien 3A, 3B, 3C, 3D; Åslyveien 3A,
+# 3B, 3C, 3E" i stedet for fem separate adresser) - bekreftet av ekte data
+# i bygg_ny/tilsyn_ny/tonsberg_hist/re_hist.
+_HUSNR_RE = r"\d+[A-Za-zæøåÆØÅ]?"
+_MULTI_NUM_LIST_RE = re.compile(
+    rf"^(?P<gate>.+?)\s+(?P<nums>{_HUSNR_RE}(?:\s*,\s*{_HUSNR_RE})*\s+og\s+{_HUSNR_RE}"
+    rf"|{_HUSNR_RE}(?:\s*,\s*{_HUSNR_RE})+)$",
+    re.IGNORECASE,
+)
+_HUSNR_FINDALL_RE = re.compile(_HUSNR_RE, re.IGNORECASE)
 
 
 def _utvid_flere_adresser(adresse):
-    """To distinkte adresser på samme gate ('Heimskringla 16 og 18',
-    'Gate 19 - 21') skrives om til 'Gate N1; Gate N2' - samme "; "-
-    konvensjon som ellers i prosjektet (se modul-docstring punkt a)."""
+    """Flere distinkte adresser på samme gate skrives om til
+    'Gate N1; Gate N2[; ...]' - samme "; "-konvensjon som ellers i
+    prosjektet (se modul-docstring punkt a). Prøver først den generelle
+    N-veis listen (2, 3 eller flere husnummer, med/uten avsluttende "og" -
+    "Åslyveien 3A, 3B, 3C", "Rambergveien 37, 39 og 41"), deretter det
+    spesifikke dash-par-mønsteret ("Gate 19 - 21") som ikke er en del av
+    komma/og-lista over."""
     if not adresse:
         return adresse
-    for rx in (_OG_PAIR_RE, _SPACED_PAIR_RE):
-        m = rx.match(adresse)
-        if m:
-            gate = m.group(1).strip()
-            return f"{gate} {m.group(2)}; {gate} {m.group(3)}"
+    m = _MULTI_NUM_LIST_RE.match(adresse)
+    if m:
+        gate = m.group("gate").strip()
+        numre = _HUSNR_FINDALL_RE.findall(m.group("nums"))
+        if len(numre) >= 2:
+            return "; ".join(f"{gate} {n}" for n in numre)
+    m = _SPACED_PAIR_RE.match(adresse)
+    if m:
+        gate = m.group(1).strip()
+        return f"{gate} {m.group(2)}; {gate} {m.group(3)}"
     return adresse
 
 
@@ -344,14 +366,21 @@ def _finn_gnrbnr_blokk_innbakt(segs):
         m = _EMBEDDED_TOKEN_RE.search(kandidat)
         if not m or m.start() == 0:
             continue  # start==0 dekkes allerede av _lopende-fallbacken
+        gnr_bnr, matrikkel = _parse_gnrbnr_expr(m.group(1))
+        if not gnr_bnr:
+            continue
         adresse_del = kandidat[:m.start()].strip()
         adresse_del = _GBNR_KEYWORD_TRAILING_RE.sub("", adresse_del).strip()
         adresse_del = adresse_del.rstrip(",").strip()
         if not _HAS_DIGIT_RE.search(adresse_del):
-            continue
-        gnr_bnr, matrikkel = _parse_gnrbnr_expr(m.group(1))
-        if not gnr_bnr:
-            continue
+            # Matrikkelnummeret ble funnet, men teksten foran det i samme
+            # segment er et sted-/gårdsnavn UTEN husnummer ("Lundteigen
+            # 220/17", "Skjeggestadåsen 226/27" - vanlig i re_hist, se
+            # modul-docstring). Behold matrikkelnr - forkast KUN
+            # adressekandidaten, ikke hele funnet (tidligere ble begge
+            # forkastet her, som utilsiktet mistet et allerede identifisert
+            # matrikkelnr).
+            return None, gnr_bnr, matrikkel
         adresse = " - ".join(segs[:i] + [adresse_del]) if i > 0 else adresse_del
         return adresse, gnr_bnr, matrikkel
     return None, None, None
@@ -377,12 +406,27 @@ def _parse_generisk(tittel, gnr_offset=0):
         return adresse, (gnr_bnr or None), _matrikkelnr(matrikkel)
 
     adresse_raw, gnr_bnr, matrikkel = _finn_gnrbnr_blokk_innbakt(segs)
-    if gnr_bnr is None:
-        return None, None, None
-    adresse = _ferdigstill_adresse(adresse_raw)
-    if gnr_offset:
-        gnr_bnr, matrikkel = _med_gnr_offset(gnr_bnr, gnr_offset), _med_gnr_offset(matrikkel, gnr_offset)
-    return adresse, (gnr_bnr or None), _matrikkelnr(matrikkel)
+    if gnr_bnr is not None:
+        adresse = _ferdigstill_adresse(adresse_raw)
+        if gnr_offset:
+            gnr_bnr, matrikkel = _med_gnr_offset(gnr_bnr, gnr_offset), _med_gnr_offset(matrikkel, gnr_offset)
+        return adresse, (gnr_bnr or None), _matrikkelnr(matrikkel)
+
+    # Siste utvei: INGEN gnr/bnr funnet noe sted i tittelen (verken som
+    # egen blokk eller innbakt i et segment). Et fåtall ekte titler har
+    # likevel en synlig gateadresse i det FØRSTE segmentet uten at
+    # matrikkelnummeret er oppgitt i tittelen i det hele tatt ("Robergveien
+    # 62 - lovlighetsavklaring", "Øystein Møylas vei 7 - fortau" - bekreftet
+    # av ekte data, særlig tilsyn_ny-titler av typen "<adresse> - Melding om
+    # mulig ulovlighet..."). Krever minst to segmenter (dvs. et faktisk
+    # skilletegn i tittelen) for å unngå å gjette adresse ut av
+    # ensegments-boilerplate-titler uten adresse ("Melding om ulovlighet
+    # 2026", der det siste "tallet" er et årstall, ikke et husnummer).
+    if len(segs) > 1:
+        kandidat = _ferdigstill_adresse(segs[0])
+        if kandidat and kandidat[0].isupper() and not kandidat.startswith("Ingen adresse"):
+            return kandidat, None, None
+    return None, None, None
 
 
 def parse_adresse_ny(tittel, subtitle=None):

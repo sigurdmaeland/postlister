@@ -90,10 +90,18 @@ def _er_gnrbnr_segment(seg):
 
 
 def parse_adresse_moss(tittel, subtitle=None):
-    """Splitter tittelen på ekte bindestrek-skilletegn, finner FØRSTE segment
-    som utelukkende er gnr/bnr, og slår sammen alt FØR det til adressen.
-    Etterfølgende rene gnr/bnr-segmenter (som i Batteriveien-eksempelet i
-    modul-docstring) slås sammen i samme gnr/bnr-liste."""
+    """Splitter tittelen på ekte bindestrek-skilletegn, finner rene
+    gnr/bnr-segmenter, og slår sammen alt FØR hvert slikt segment (eller
+    -segment-run) til en adresse. Etterfølgende rene gnr/bnr-segmenter (som
+    i Batteriveien-eksempelet i modul-docstring) slås sammen i samme
+    gnr/bnr-liste.
+
+    Et fåtall titler har FLERE adresse+gnr/bnr-blokker i samme tittel, f.eks.
+    "Ryggeveien - 406/410 - Blomsholmveien 1-3 - 104/277 - utbedring av
+    balkonger og terrasser" (to bygg, hver med egen adresse og eget
+    matrikkelnummer). Løkken under fortsetter derfor å søke etter NYE
+    gnr/bnr-blokker etter hver funnet blokk, i stedet for å stoppe ved den
+    første - ellers forsvinner adresse+gnr/bnr nr. 2 (og ev. senere) helt."""
     if not tittel:
         return None, None, None
 
@@ -102,31 +110,44 @@ def parse_adresse_moss(tittel, subtitle=None):
     if not segs:
         return None, None, None
 
-    start = None
-    for i, seg in enumerate(segs):
-        if _er_gnrbnr_segment(seg):
-            start = i
+    adresser = []
+    gnr_bnr_liste = []
+    pos = 0
+    fant_blokk = False
+
+    while pos < len(segs):
+        start = None
+        for i in range(pos, len(segs)):
+            if _er_gnrbnr_segment(segs[i]):
+                start = i
+                break
+        if start is None:
             break
-    if start is None:
+
+        end = start
+        for j in range(start + 1, len(segs)):
+            if _er_gnrbnr_segment(segs[j]):
+                end = j
+            else:
+                break
+
+        if start > pos:
+            adresser.append(" - ".join(segs[pos:start]))
+
+        for k in range(start, end + 1):
+            clean = _PAREN_RE.sub("", segs[k])
+            for m in _TOKEN_RE.finditer(clean):
+                par = f"{m.group(1)}/{m.group(2)}"
+                if par not in gnr_bnr_liste:
+                    gnr_bnr_liste.append(par)
+
+        fant_blokk = True
+        pos = end + 1
+
+    if not fant_blokk:
         return None, None, None
 
-    end = start
-    for j in range(start + 1, len(segs)):
-        if _er_gnrbnr_segment(segs[j]):
-            end = j
-        else:
-            break
-
-    adresse = " - ".join(segs[:start]) if start > 0 else None
-
-    gnr_bnr_liste = []
-    for k in range(start, end + 1):
-        clean = _PAREN_RE.sub("", segs[k])
-        for m in _TOKEN_RE.finditer(clean):
-            par = f"{m.group(1)}/{m.group(2)}"
-            if par not in gnr_bnr_liste:
-                gnr_bnr_liste.append(par)
-
+    adresse = "; ".join(adresser) if adresser else None
     matrikkelnr = ("; ".join(f"{KOMMUNE_NR}-{p}" for p in gnr_bnr_liste)
                    if gnr_bnr_liste else None)
     return adresse, (gnr_bnr_liste or None), matrikkelnr

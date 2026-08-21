@@ -254,19 +254,76 @@ def _portal_url(list_id):
 
 
 # --------------------------------------------------------------------------- #
-# gnr/bnr/matrikkelnr - strukturert fra API-et (propertyIdentifications)
+# gnr/bnr/matrikkelnr - API-et (propertyIdentifications) + tittel-fallback
 # --------------------------------------------------------------------------- #
-def gnr_bnr_matrikkel(property_identifications):
-    """Dedupe (propertyNr, useNr)-par (de dubleres i lista) -> gnr_bnr + matrikkelnr."""
-    seen = []
+# For "bygg" (aktiv lista, adresse-først-tittel): fanger gnr/bnr[/feste/
+# seksjon] KUN når tallkjeden innledes av tittel-start, komma, bindestrek,
+# åpningsparentes eller "og" (dekker lister som "110/132, 110/531 og
+# 110/5010") - IKKE når det er del av et sakstall/referansenummer i parentes
+# ("(ref. BYGG-19/00245)": "19" innledes riktignok av en bindestrek, men et
+# ekte gnr/bnr har ALDRI et bruksnummer med ledende null slik saksnummer-
+# sekvenser har - se _har_ledende_null). Hele tallkjeden fanges (ikke bare de
+# to første tallene) av samme grunn som Trondheim/Tromsø: et fåtall titler
+# kan skrive kommunenummeret først (se _gnr_bnr_fra_tallkjede).
+_TITLE_GNR_BNR = re.compile(r"(?:^|[,\-(]|\bog\b)\s*(\d{1,4}(?:/\d{1,5}){1,3})", re.IGNORECASE)
+
+
+def _har_ledende_null(tall):
+    return len(tall) > 1 and tall[0] == "0"
+
+
+def _gnr_bnr_fra_tallkjede(tallkjede):
+    """Tolk en tallkjede "A/B[/C[/D]]" som gnr/bnr - hopper over en ledende
+    KOMMUNE_NR hvis kjeden starter med den (samme mønster som Trondheim/
+    Tromsø)."""
+    nums = [n.strip() for n in tallkjede.split("/")]
+    if nums[0] == str(KOMMUNE_NR) and len(nums) >= 3:
+        return nums[1], nums[2]
+    return nums[0], nums[1]
+
+
+def gnr_bnr_fra_tittel(tittel):
+    """Fallback/tillegg for "bygg" (aktiv lista) - se _TITLE_GNR_BNR. gnr "0"
+    er kildens plassholder for "ingen egen eiendom"; et tallpar med ledende
+    null i gnr ELLER bnr er nesten alltid et saksreferansenummer, ikke en
+    ekte matrikkel (bekreftet på ekte data, se modul-kommentar over) - begge
+    utelates."""
+    if not tittel:
+        return []
+    pairs = []
+    for m in _TITLE_GNR_BNR.finditer(tittel):
+        gnr, bnr = _gnr_bnr_fra_tallkjede(m.group(1))
+        if gnr == "0" or _har_ledende_null(gnr) or _har_ledende_null(bnr):
+            continue
+        pair = f"{gnr}/{bnr}"
+        if pair not in pairs:
+            pairs.append(pair)
+    return pairs
+
+
+def gnr_bnr_matrikkel(property_identifications, tittel=None):
+    """Dedupe (propertyNr, useNr)-par (de dubleres i lista) fra API-et,
+    beriket additivt med gnr/bnr parset fra tittelen (se gnr_bnr_fra_tittel)
+    - propertyIdentifications er ofte tomt selv når tittelen klart har
+    gnr/bnr (bekreftet på ekte data, f.eks. "Ingen adresse, 110/132, 110/531
+    og 110/5010 - , Oppmålingsforretning..." -> propertyIdentifications
+    tomt). Brukes KUN for "bygg" (aktiv lista) - "bygg_hist" har sin egen,
+    strukturelt annerledes tittel-fallback, se gnr_bnr_fra_tittel_hist."""
+    pairs = []
     for pid in property_identifications or []:
-        pair = (pid.get("propertyNr"), pid.get("useNr"))
-        if pair not in seen and pair[0] is not None and pair[1] is not None:
-            seen.append(pair)
-    if not seen:
+        gnr, bnr = pid.get("propertyNr"), pid.get("useNr")
+        if gnr is None or bnr is None:
+            continue
+        pair = f"{gnr}/{bnr}"
+        if pair not in pairs:
+            pairs.append(pair)
+    for pair in gnr_bnr_fra_tittel(tittel):
+        if pair not in pairs:
+            pairs.append(pair)
+    if not pairs:
         return None, None
-    gnr_bnr = "; ".join(f"{gnr}/{bnr}" for gnr, bnr in seen)
-    matrikkelnr = "; ".join(f"{KOMMUNE_NR}-{gnr}/{bnr}" for gnr, bnr in seen)
+    gnr_bnr = "; ".join(pairs)
+    matrikkelnr = "; ".join(f"{KOMMUNE_NR}-{p}" for p in pairs)
     return gnr_bnr, matrikkelnr
 
 
@@ -283,6 +340,12 @@ _STREET_AND_NUMBER_RANGE = re.compile(rf"^(.+?)\s+({_TOKEN})$")
 _PART_SPLIT = re.compile(r"\s*(,|\bog\b)\s*")
 _STARTS_UPPER = re.compile(r"^[A-ZÆØÅ]")
 _PAREN_CONTENT = re.compile(r"\(([^)]*)\)")
+# Et lite mindretall titler bryter "adresse først"-konvensjonen og har i
+# stedet et bart gnr/bnr FØRST, skilt med " - " ("218/84/0/0 - Valmueveien
+# 5, ..."). Uten dette strippet leser dash_idx-kuttet i extract_adresse()
+# feilaktig HELE resten (inkl. selve adressen) som beskrivelse og forkaster
+# den (bekreftet på ekte data - se rapport).
+_LEADING_MATRIKKEL_DASH = re.compile(r"^\d+/\d+(?:/\d+){0,2}\s*-\s*")
 
 
 def _normalize_nummer_bokstav(s):
@@ -354,6 +417,7 @@ def extract_adresse(tittel):
 
     text = _PARENS.sub("", tittel)
     text = _MFL.sub("", text)
+    text = _LEADING_MATRIKKEL_DASH.sub("", text)
     dash_idx = text.find(" - ")
     if dash_idx != -1:
         text = text[:dash_idx]
@@ -383,6 +447,34 @@ _GNR_TILLEGG_BARE = re.compile(r"\s*,\s*\d+(?:\s*/\s*\d+){1,3}")
 _GNR_EKSTRA = re.compile(r"\s*,?\s*(?:fnr|snr)\.?\s*\d+", re.IGNORECASE)
 _GNR_SEP = re.compile(r"\s*[-–:,.]?\s*")
 _GATE_NR = re.compile(r"^([A-Za-zÆØÅæøå][A-Za-zÆØÅæøå0-9.\-' ]*?\s\d+\s*[A-Za-z]?)\b")
+# Noen titler har en ekstra saks-/matrikkel-henvisning RETT ETTER den første
+# (som _GATE_NR da leser inn som om det var gatenavn+husnummer, siden det
+# ikke fins noe skille å stoppe på), f.eks. "Ref. sak 99/3243" -> "...Ref.
+# sak 99", "GNR 35 BNR. 7" -> "TIL GNR 35", "ANR. 23" (andelsnummer) -> "...
+# ANR. 23". Disse ordene opptrer ALDRI i et ekte gatenavn (bekreftet på ekte
+# data - se rapport) og forkastes derfor i stedet for å gjettes som adresse.
+_REJECT_WORDS_HIST = re.compile(r"\b(?:ref|gnr|bnr|snr|fnr|anr|sak)\b\.?", re.IGNORECASE)
+# Rene sakstype-/beskrivelsessetninger uten adresse kan tilfeldigvis ende på
+# et tall som _GATE_NR leser som et husnummer - typisk et årstall i en
+# skattetakst-/klagesak uten egen gateadresse, f.eks. "18/37 KLAGE PÅ
+# EIENDOMSSKATTETAKST 2014" (bekreftet feilaktig lest som adresse "KLAGE PÅ
+# EIENDOMSSKATTETAKST 2014" på ekte data - se rapport). Disse ordene opptrer
+# ALDRI som starten på et ekte gatenavn i arkivet.
+_DESCRIPTION_MARKERS_HIST = re.compile(
+    r"^(?:klage|søknad|melding|varsel|tillatelse|dispensasjon|anmodning|"
+    r"forespørsel|henvendelse|tilsyn|ulovlighet\w*|ferdigattest|"
+    r"rammetillatelse|igangsettingstillatelse|oppmålingsforretning|"
+    r"seksjonering\w*|skattetakst|eiendomsskattetakst|takst|bruksendring|"
+    r"riving|nybygg|tilbygg|påbygg)\b",
+    re.IGNORECASE,
+)
+# Et fåtall bygg_hist-titler har verken "Gbnr."-merket eller bar gnr/bnr
+# først, men et RENT saksreferansenummer (ingen "/", altså ikke matrikkel)
+# fulgt av " - adresse - beskrivelse", f.eks. "217134 - MARKVEIEN 26D -
+# TILLATELSE TIL..." (bekreftet på ekte data - se rapport). gnr/bnr forblir
+# None her (referansenummeret er ikke en matrikkel), men adressen skal
+# fortsatt hentes ut.
+_REF_NUM_PREFIX = re.compile(r"^\d{3,8}\s*-\s*")
 
 
 def extract_adresse_hist(tittel):
@@ -405,31 +497,77 @@ def extract_adresse_hist(tittel):
         return None
     tekst = " ".join(tittel.split())
     m = _LABELED_GNR.match(tekst) or _BARE_GNR.match(tekst)
-    if not m:
-        return None
-    slutt = m.end()
-    while True:
-        m2 = _GNR_TILLEGG_OGMFL.match(tekst[slutt:]) or _GNR_TILLEGG_BARE.match(tekst[slutt:])
-        if not m2:
-            break
-        slutt += m2.end()
-    while True:
-        m3 = _GNR_EKSTRA.match(tekst[slutt:])
-        if not m3:
-            break
-        slutt += m3.end()
-    sep = _GNR_SEP.match(tekst[slutt:])
-    if sep:
-        slutt += sep.end()
+    if m:
+        slutt = m.end()
+        while True:
+            m2 = _GNR_TILLEGG_OGMFL.match(tekst[slutt:]) or _GNR_TILLEGG_BARE.match(tekst[slutt:])
+            if not m2:
+                break
+            slutt += m2.end()
+        while True:
+            m3 = _GNR_EKSTRA.match(tekst[slutt:])
+            if not m3:
+                break
+            slutt += m3.end()
+        sep = _GNR_SEP.match(tekst[slutt:])
+        if sep:
+            slutt += sep.end()
+    else:
+        # Ingen gnr/bnr-prefiks funnet - prøv det rene referansenummer-
+        # formatet ("217134 - MARKVEIEN 26D - ...", se _REF_NUM_PREFIX).
+        m_ref = _REF_NUM_PREFIX.match(tekst)
+        if not m_ref:
+            return None
+        slutt = m_ref.end()
     rest = tekst[slutt:]
     m4 = _GATE_NR.match(rest)
     if not m4:
         return None
     candidate = re.sub(r"\s+", " ", m4.group(1)).strip(" .,-")
+    if _REJECT_WORDS_HIST.search(candidate):
+        return None
+    if _DESCRIPTION_MARKERS_HIST.match(candidate):
+        return None
     ord_ = re.findall(r"[A-Za-zÆØÅæøå]+", candidate)
     if not any(len(w) >= 3 for w in ord_):
         return None
     return candidate
+
+
+def gnr_bnr_fra_tittel_hist(tittel):
+    """Finn gnr/bnr-par i en bygg_hist-tittel - gjenbruker EKSAKT samme
+    gjenkjenning av matrikkel-prefikset som extract_adresse_hist over (samme
+    _LABELED_GNR/_BARE_GNR-match + og/mfl/fnr/snr-tilleggsløkke), men
+    returnerer selve tallene i stedet for bare å bruke dem til å vite hvor
+    adressen begynner. Fungerer UAVHENGIG av om adressen etterpå faktisk lar
+    seg tolke - f.eks. "6/9/35 - KROKÅSEN - BRUKSENDRING" har ingen
+    husnummer og gir adresse=None (se extract_adresse_hist), men gnr/bnr
+    (6/9) skal likevel med. Rene referansenummer-titler (se _REF_NUM_PREFIX)
+    har ALDRI et ekte gnr/bnr og gir tomt her, i tråd med det."""
+    if not tittel:
+        return []
+    tekst = " ".join(tittel.split())
+    m = _LABELED_GNR.match(tekst) or _BARE_GNR.match(tekst)
+    if not m:
+        return []
+    matchet_tekst = tekst[:m.end()]
+    slutt = m.end()
+    while True:
+        m2 = _GNR_TILLEGG_OGMFL.match(tekst[slutt:]) or _GNR_TILLEGG_BARE.match(tekst[slutt:])
+        if not m2:
+            break
+        matchet_tekst += m2.group(0)
+        slutt += m2.end()
+    pairs = []
+    for tallpar in re.findall(r"\d+(?:\s*/\s*\d+){1,3}", matchet_tekst):
+        nums = [n.strip() for n in re.split(r"\s*/\s*", tallpar)]
+        gnr, bnr = nums[0], nums[1]
+        if gnr == "0" or _har_ledende_null(gnr) or _har_ledende_null(bnr):
+            continue
+        pair = f"{gnr}/{bnr}"
+        if pair not in pairs:
+            pairs.append(pair)
+    return pairs
 
 
 # --------------------------------------------------------------------------- #
@@ -675,7 +813,9 @@ def fetch_saker_for_period(session, list_id, subarchive_id, start, end):
 # Engangs historisk dump - "bygg" (2020-today_dump, én subArchiveId)
 # --------------------------------------------------------------------------- #
 def build_sak(proceeding, journalposter, list_id, subarchive_id):
-    gnr_bnr, matrikkelnr = gnr_bnr_matrikkel(proceeding.get("propertyIdentifications"))
+    gnr_bnr, matrikkelnr = gnr_bnr_matrikkel(
+        proceeding.get("propertyIdentifications"), proceeding.get("title")
+    )
     saksnummer = proceeding.get("sequenceNumber")
     return {
         "identifier": proceeding.get("id"),
@@ -721,8 +861,33 @@ def run_full_dump(kilde_key, output_file, start=None, end=None):
 # --------------------------------------------------------------------------- #
 # Engangs historisk dump - "bygg_hist" (seks sub-arkiv, egen LIST_ID)
 # --------------------------------------------------------------------------- #
+def gnr_bnr_matrikkel_hist(property_identifications, tittel):
+    """Som gnr_bnr_matrikkel(), men for "bygg_hist" - beriket additivt med
+    gnr/bnr_fra_tittel_hist() i stedet for den generelle gnr_bnr_fra_tittel()
+    (bygg_hist har en strukturelt annerledes tittel-dialekt, se modul-
+    docstring og extract_adresse_hist)."""
+    pairs = []
+    for pid in property_identifications or []:
+        gnr, bnr = pid.get("propertyNr"), pid.get("useNr")
+        if gnr is None or bnr is None:
+            continue
+        pair = f"{gnr}/{bnr}"
+        if pair not in pairs:
+            pairs.append(pair)
+    for pair in gnr_bnr_fra_tittel_hist(tittel):
+        if pair not in pairs:
+            pairs.append(pair)
+    if not pairs:
+        return None, None
+    gnr_bnr = "; ".join(pairs)
+    matrikkelnr = "; ".join(f"{KOMMUNE_NR}-{p}" for p in pairs)
+    return gnr_bnr, matrikkelnr
+
+
 def build_sak_hist(proceeding, journalposter, list_id, subarchive_id):
-    gnr_bnr, matrikkelnr = gnr_bnr_matrikkel(proceeding.get("propertyIdentifications"))
+    gnr_bnr, matrikkelnr = gnr_bnr_matrikkel_hist(
+        proceeding.get("propertyIdentifications"), proceeding.get("title")
+    )
     saksnummer = proceeding.get("sequenceNumber")
     return {
         "identifier": proceeding.get("id"),

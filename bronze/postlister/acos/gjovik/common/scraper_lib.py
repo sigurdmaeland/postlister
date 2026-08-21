@@ -79,6 +79,19 @@ _MATRIKKEL_SEGMENT_RE = re.compile(
 # Skilletegnet mellom matrikkelnr og adresse varierer (se modul-docstring).
 _SEP_RE = re.compile(r"^\s*(?:[-,]\s*)?")
 
+# Adressekandidaten kan selv romme flere husnumre på samme gate ("Parkgata 6,
+# 8 og 10", "Bassengvegen 14 og 14A") - eller mer sjeldent flere ulike gater
+# ("Bjørnsonsgate 1 og Kirkegata 4"). _splitt_multiadresse deler dette opp i
+# enkelt-adresser (samme algoritme som brukt for tilsvarende oppramsinger i
+# Bærums scraper_lib.py, portert hit siden Gjøvik ikke har noe adressepanel å
+# hente en ferdig splittet liste fra - adressen kommer alltid fra tittelen).
+_HUSNUMMER_TOKEN = r"\d+[A-Za-zæøåÆØÅ]?(?:\s*-\s*(?:\d+[A-Za-zæøåÆØÅ]?|[A-Za-zæøåÆØÅ]))?"
+_BART_HUSNUMMER = re.compile(rf"^{_HUSNUMMER_TOKEN}$")
+_BAR_BOKSTAV = re.compile(r"^[A-Za-zæøåÆØÅ]$")
+_GATE_OG_HUSNUMMER = re.compile(rf"^(.+?)\s+({_HUSNUMMER_TOKEN})$")
+_MULTIADRESSE_SPLIT = re.compile(r"\s*(,|\bog\b)\s*")
+_STARTER_STOR_BOKSTAV = re.compile(r"^[A-ZÆØÅ]")
+
 
 def _normalize_nummer_bokstav(s):
     return _NUM_LETTER_SPACE.sub(r"\1\2", s)
@@ -96,6 +109,52 @@ def _rens_adresse(addr):
     if m.group("sted"):
         return padded[:m.start("sted")].strip()
     return addr
+
+
+def _splitt_multiadresse(candidate):
+    """Del en renset adressekandidat opp i enkelt-adresser der flere
+    husnumre/gater er ramset opp med komma og/eller " og " (se kommentar over
+    konstantene). Et bart tall/bokstav-element arver gatenavnet (og evt. siste
+    husnummer, for bokstav-suffikser) fra forrige fulle element. Gir tilbake
+    kandidaten uendret (som ett element) hvis oppramsingen ikke følger et
+    gjenkjennelig mønster - vi gjetter aldri, vi bare unngår å la en gyldig
+    enkel adresse gå tapt."""
+    entries = []
+    current_street, last_number = None, None
+    tokens = _MULTIADRESSE_SPLIT.split(candidate)
+    parts = [(None, tokens[0])] + list(zip(tokens[1::2], tokens[2::2]))
+    for sep, part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if _BAR_BOKSTAV.match(part):
+            if current_street is None or last_number is None:
+                return [candidate]
+            entries.append(f"{current_street} {last_number}{part}")
+            continue
+        if _BART_HUSNUMMER.match(part):
+            if current_street is None:
+                return [candidate]
+            entries.append(f"{current_street} {part}")
+            m = re.match(r"^(\d+)", part)
+            if m:
+                last_number = m.group(1)
+            continue
+        sm = _GATE_OG_HUSNUMMER.match(part)
+        if sm and (sep is None or _STARTER_STOR_BOKSTAV.match(sm.group(1).strip())):
+            current_street = sm.group(1).strip()
+            entries.append(f"{current_street} {sm.group(2)}")
+            m = re.match(r"^(\d+)", sm.group(2))
+            if m:
+                last_number = m.group(1)
+            continue
+        return [candidate]
+    seen, uniq = set(), []
+    for e in entries:
+        if e not in seen:
+            seen.add(e)
+            uniq.append(e)
+    return uniq or [candidate]
 
 
 def parse_adresse_gjovik(tittel, subtitle=None):
@@ -131,7 +190,9 @@ def parse_adresse_gjovik(tittel, subtitle=None):
     forste_segment = rest.split(" - ", 1)[0].strip()
     adresse = None
     if forste_segment and not _INGEN_ADRESSE.match(forste_segment):
-        adresse = _rens_adresse(_normalize_nummer_bokstav(forste_segment))
+        renset = _rens_adresse(_normalize_nummer_bokstav(forste_segment))
+        if renset:
+            adresse = "; ".join(_splitt_multiadresse(renset))
 
     matrikkelnr = ("; ".join(f"{KOMMUNE_NR}-{d}" for d in matrikkel_deler)
                    if matrikkel_deler else None)

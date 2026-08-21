@@ -64,7 +64,7 @@ _TOKEN = r"\d+[A-Za-zæøåÆØÅ]?(?:\s*-\s*(?:\d+[A-Za-zæøåÆØÅ]?|[A-Za-z
 _BARE_TOKEN_FULL = re.compile(rf"^{_TOKEN}$")
 _BARE_LETTER_TOKEN = re.compile(r"^[A-Za-zæøåÆØÅ]$")
 _STREET_AND_NUMBER_RANGE = re.compile(rf"^(.+?)\s+({_TOKEN})$")
-_PART_SPLIT = re.compile(r"\s*(,|\bog\b)\s*")
+_PART_SPLIT = re.compile(r"\s*(,|\bog\b|&)\s*")
 _STARTS_UPPER = re.compile(r"^[A-ZÆØÅ]")
 
 
@@ -213,8 +213,14 @@ def build_matrikkelnr(gnr_bnr_list, kommune_nr, tittel=None):
 
 _HAR_HUSNUMMER = re.compile(r"\s\d+[A-Za-zæøåÆØÅ]?(-\w+)?$")
 # " - GNR/BNR - melding om mulig ulovlig tiltak - ..." - eldre/uformelt
-# rapporterte ulovlighetssaker; gnr/bnr kan mangle (vist som en bar "/").
-_DASH_GNRBNR = re.compile(r"\s-\s(\d+/\d+(?:/\d+)?|/)\s-\s")
+# rapporterte ulovlighetssaker; gnr/bnr kan mangle. Vises da enten som en
+# bar "/", ELLER (bekreftet i ekte data) som adressen selv gjentatt med en
+# etterhengt "/" - f.eks. "Granlia 33 - Granlia 33/ - melding om ...", der
+# kildesystemet tydeligvis bruker adressefeltet som plassholder når det
+# ikke har noe reelt gnr/bnr å vise. Uansett hvilken variant - gnr_bnr
+# forblir None (ingen reell verdi å hente ut), men selve adressen (delen
+# FØR den første bindestreken) hentes fortsatt ut.
+_DASH_GNRBNR = re.compile(r"\s-\s(\d+/\d+(?:/\d+)?|/|[^-/]*/)\s-\s")
 # "Gatenavn [Nummer] GNR/BNR[/FESTENR/SEKSJONSNR][,] beskrivelse" - vanligste
 # formatet for bygg/henv/tilsyn (og en del ulov).
 _GNR_BNR_TITLE = re.compile(r"(\d+)/(\d+)(?:/\d+){0,2}")
@@ -229,14 +235,21 @@ def _har_husnummer(addr):
 
 
 def address_from_tittel(tittel, kommune_nr):
-    """Utleder (adresse, gnr_bnr) direkte fra sakstittelen - brukes som
+    """Utleder (adresse_liste, gnr_bnr) direkte fra sakstittelen - brukes som
     fallback når adresse-panelet på siden er tomt (skjer ofte for useriøst
-    rapporterte ulovlighetssaker). To kjente formater: (1) "Gatenavn
+    rapporterte ulovlighetssaker). Tre kjente formater: (1) "Gatenavn
     [Nummer] GNR/BNR[/FESTENR/SEKSJONSNR][,] beskrivelse" (vanligst), (2)
     "Gatenavn Nummer - GNR/BNR - melding om mulig ulovlig tiltak - ..."
     (eldre ulovlighetssaker; gnr/bnr kan mangle, vist som bar "/", eller
-    vises som kommunenr/gnr/bnr). Returnerer None for adresse hvis
-    kandidaten ikke har et ekte husnummer til slutt."""
+    vises som kommunenr/gnr/bnr), (3) "GNR/BNR/FESTENR/SEKSJONSNR Gatenavn
+    Nummer, beskrivelse" - matrikkelnummeret FØRST i tittelen i stedet for
+    etter gateadressen. Hvis tittelen ikke har noe gnr/bnr i det hele tatt,
+    sjekkes om starten av tittelen likevel ser ut som en ren adresse
+    ("Gatenavn Nummer, beskrivelse", typisk for henvendelser/bevillinger uten
+    matrikkeltilknytning). Kandidaten kjøres gjennom samme flerdresse-
+    splitting som adresse-panelet (_parse_address_parts), slik at "Gate 4 og
+    12" blir to adresser i stedet for én sammenslått streng. Returnerer None
+    for adresse hvis kandidaten ikke har et ekte husnummer til slutt."""
     if not tittel:
         return None, None
 
@@ -258,15 +271,75 @@ def address_from_tittel(tittel, kommune_nr):
         gm = _GNR_BNR_TITLE.search(tittel)
         if gm:
             gnr_bnr = f"{gm.group(1)}/{gm.group(2)}"
-            addr_candidate = tittel[:gm.start()].strip().rstrip(",").strip()
+            if gm.start() == 0:
+                # Matrikkelnummeret står FØRST - adressen kommer etter det,
+                # ikke før (format 3, se docstring).
+                addr_candidate = tittel[gm.end():].lstrip().split(",", 1)[0].strip()
+            else:
+                addr_candidate = re.sub(r"[\s,\-]+$", "", tittel[:gm.start()].strip())
+        else:
+            # Ingen gnr/bnr i tittelen i det hele tatt - se om starten
+            # likevel ser ut som en ren adresse uten matrikkeltilknytning.
+            addr_candidate = tittel.split(",", 1)[0].strip()
 
-    adresse = None
+    # Kandidaten kan selv starte med "Ingen adresse" selv om den ikke gjør
+    # det for HELE tittelen - i så fall forkastes den helt i stedet for å
+    # prøve å plukke ut en "ekte" adresse etter frasen, i tråd med samme
+    # føre-var-holdning som når hele tittelen starter med den frasen.
+    if addr_candidate and _INGEN_ADRESSE.match(addr_candidate.strip()):
+        addr_candidate = None
+
+    # En ekte gateadresse starter alltid med stor bokstav (egennavn) - luker
+    # ut støy som "m.fl. - Kvartal 15" eller "og 10/53 - Ingen adresse - ..."
+    # (rester av tittelen som havnet i kandidaten pga. et sammensatt/uvanlig
+    # matrikkel- eller "m.fl."-format) og bare tall/plassholdere ("0", "0000").
+    if addr_candidate and not _STARTS_UPPER.match(addr_candidate):
+        addr_candidate = None
+
+    adresse_liste = None
     if addr_candidate and not ingen_adresse:
         normalized = _normalize_nummer_bokstav(addr_candidate)
-        if _har_husnummer(normalized):
-            adresse = normalized
+        entries = _parse_address_parts(normalized)
+        if not entries and _har_husnummer(normalized):
+            entries = [normalized]   # kandidaten splittes ikke, men er selv gyldig
+        if entries:
+            adresse_liste = entries
 
-    return adresse, gnr_bnr
+    return adresse_liste, gnr_bnr
+
+
+_GNR_BNR_PAIR = re.compile(r"(\d+)/(\d+)(?:/\d+){0,2}")
+_MATRIKKEL_SEP = re.compile(r"\s*(?:,|\bog\b)\s*")
+
+
+def extra_gnr_bnr_fra_tittel(tittel):
+    """Finn EKSTRA gnr/bnr-par oppgitt sammen med det første i en "og"/","-
+    atskilt matrikkelliste i sakstittelen, f.eks. "244/30/0/0 og 244/70,
+    Ingen adresse, ..." eller "10/52/0/0 og 10/53 Branderudveien 2, ...".
+    Disse sakene gjelder flere eiendommer samtidig - det andre (og evt.
+    tredje osv.) paret finnes ALLTID i TILLEGG til det adresse-panelet
+    allerede måtte ha gitt (som typisk kun viser det første), derfor kalles
+    denne alltid fra parse_case, uavhengig av om adresse/gnr_bnr allerede
+    er fylt ut fra andre kilder. Stopper ved første ledd som ikke selv er
+    et nytt matrikkelnummer, for å unngå å plukke opp uskyldige tall lenger
+    ute i beskrivelsesteksten."""
+    if not tittel:
+        return []
+    m = _GNR_BNR_TITLE.search(tittel)
+    if not m:
+        return []
+    pairs = []
+    pos = m.end()
+    while True:
+        sep = _MATRIKKEL_SEP.match(tittel, pos)
+        if not sep:
+            break
+        pm = _GNR_BNR_PAIR.match(tittel, sep.end())
+        if not pm:
+            break
+        pairs.append(f"{pm.group(1)}/{pm.group(2)}")
+        pos = pm.end()
+    return pairs
 
 
 # Saksnummer-prefikset koder sakstypen, f.eks. "BYGG-26/02299" -> Byggesak.
@@ -459,9 +532,17 @@ def parse_case(html, document_id):
     if not adresse_clean or not gnr_bnr_clean:
         fallback_adresse, fallback_gnr_bnr = address_from_tittel(sakstittel, KOMMUNE_NR)
         if not adresse_clean and fallback_adresse:
-            adresse_clean = [fallback_adresse]
+            adresse_clean = list(fallback_adresse)
         if not gnr_bnr_clean and fallback_gnr_bnr:
             gnr_bnr_clean = [fallback_gnr_bnr]
+
+    # Saken kan gjelde FLERE eiendommer samtidig ("244/30/0/0 og 244/70,
+    # ...") - fanger opp ekstra gnr/bnr-par fra en slik liste i tittelen,
+    # uansett hvor adresse/gnr_bnr for øvrig kom fra (rent tillegg, aldri
+    # en overstyring).
+    for ekstra in extra_gnr_bnr_fra_tittel(sakstittel):
+        if ekstra not in gnr_bnr_clean:
+            gnr_bnr_clean.append(ekstra)
 
     return {
         "document_id": str(document_id),

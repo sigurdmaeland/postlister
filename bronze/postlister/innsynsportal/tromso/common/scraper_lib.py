@@ -38,11 +38,16 @@ Adresseformat (bekreftet ved stikkprøve av 60+ ekte titler på tvers av alle
 fire sakstyper): "GNR/BNR[/FESTE[/SEKSJON]] Gatenavn Nummer, beskrivelse"
 - matrikkelnr FØRST (som Sarpsborg/Gjøvik), etterfulgt av et mellomrom
 (IKKE bindestrek/komma - enklere enn både Trondheim og Gjøvik), så selve
-adressen, så et komma, så beskrivelsen. gnr/bnr/feste/seksjon hentes
-uansett strukturert fra proceeding.propertyIdentifications (samme felt og
-samme gnr_bnr_matrikkel()-funksjon som Trondheim/Asker bruker) - den ledende
-matrikkelnr-teksten i tittelen brukes KUN til å vite hvor selve adressen
-begynner, ikke som datakilde for gnr/bnr. Et lite mindretall titler mangler
+adressen, så et komma, så beskrivelsen. gnr/bnr hentes primært strukturert
+fra proceeding.propertyIdentifications (samme felt som Trondheim/Asker
+bruker), men dette feltet er ofte tomt i praksis selv når tittelen klart
+har gnr/bnr (bekreftet på ekte data, f.eks. "Skårungevegen 10, 117/828,
+Påbygg til bolig" -> propertyIdentifications tomt). gnr_bnr_matrikkel()
+faller derfor tilbake på/beriker alltid additivt med gnr/bnr parset direkte
+fra tittelen (se gnr_bnr_fra_tittel) - både det ledende matrikkelnr-
+prefikset og eventuelle restaterte/ekstra gnr/bnr som følger etter (f.eks.
+et opprinnelig/overordnet gnr/bnr i parentes for en utskilt enhet, "118/1748
+(117/1723) - Nordheimvegen ..."). Et lite mindretall titler mangler
 matrikkelnr-prefikset helt (rene firmanavn-tilsyn som "Tore Workinn AS,
 tilsyn med kvalifikasjoner", eller bare "-") - disse behandles som
 "ingen adresse" (samme avveining som andre steder i kodebasen).
@@ -237,20 +242,72 @@ fragment JournalResult on Journal {
 
 
 # --------------------------------------------------------------------------- #
-# gnr/bnr/matrikkelnr - strukturert fra API-et (propertyIdentifications)
+# gnr/bnr/matrikkelnr - API-et (propertyIdentifications) + tittel-fallback
 # --------------------------------------------------------------------------- #
-def gnr_bnr_matrikkel(property_identifications):
-    """Dedupe (propertyNr, useNr)-par (de dubleres ofte i lista) -> gnr_bnr +
-    matrikkelnr. Identisk med Trondheim/Asker sin funksjon - samme API-felt."""
-    seen = []
+# Fanger gnr/bnr[/feste[/seksjon]] KUN når tallkjeden innledes av tittel-start,
+# komma, bindestrek eller åpningsparentes - IKKE når det er en del av selve
+# gateadressen ("Fr.Langesgt. 19/21" er et hus-nummerspenn, ikke et
+# matrikkelfelt: der står tallparet rett etter et gatenavn+mellomrom, uten
+# komma/bindestrek/parentes foran - bekreftet ved stikkprøve at ekte gnr/bnr-
+# oppføringer i denne kilden ALLTID har ett av disse skilletegnene foran seg,
+# mens gate-husnummerspenn ALDRI har det). gnr "0" er kildens plassholder for
+# "ingen egen eiendom" (forekommer aldri i ekte propertyIdentifications-data)
+# og utelates. Hele tallkjeden fanges (ikke bare de første to tallene) fordi
+# et fåtall titler skriver kommunenummeret FØRST i kjeden (se
+# _gnr_bnr_fra_tallkjede - samme mønster bekreftet på ekte data i Trondheim,
+# forsvarlig å beskytte mot her også siden formatet deles på samme plattform).
+_TITLE_GNR_BNR = re.compile(r"(?:^|[,\-(])\s*(\d{1,4}(?:/\d{1,5}){1,3})")
+
+
+def _gnr_bnr_fra_tallkjede(tallkjede):
+    """Tolk en tallkjede "A/B[/C[/D]]" som gnr/bnr - hopper over en ledende
+    KOMMUNE_NR hvis kjeden starter med den (se _TITLE_GNR_BNR over)."""
+    nums = tallkjede.split("/")
+    if nums[0] == str(KOMMUNE_NR) and len(nums) >= 3:
+        return nums[1], nums[2]
+    return nums[0], nums[1]
+
+
+def gnr_bnr_fra_tittel(tittel):
+    """Finn ALLE gnr/bnr-par i sakstittelen (uansett posisjon - ledende
+    matrikkelnr, restatert/ekstra matrikkelnr i parentes, eller et matrikkelnr
+    som følger etter adressen, f.eks. "Skårungevegen 10, 117/828, ..."). Brukt
+    som fallback/tillegg til propertyIdentifications i gnr_bnr_matrikkel()."""
+    if not tittel:
+        return []
+    pairs = []
+    for m in _TITLE_GNR_BNR.finditer(tittel):
+        gnr, bnr = _gnr_bnr_fra_tallkjede(m.group(1))
+        if gnr == "0":
+            continue
+        pair = f"{gnr}/{bnr}"
+        if pair not in pairs:
+            pairs.append(pair)
+    return pairs
+
+
+def gnr_bnr_matrikkel(property_identifications, tittel=None):
+    """Dedupe (propertyNr, useNr)-par (de dubleres ofte i lista) fra API-et,
+    beriket additivt med gnr/bnr parset fra tittelen (se gnr_bnr_fra_tittel) -
+    både som fallback når API-et ikke gir noe, og som tillegg når tittelen
+    restaterer et EKSTRA gnr/bnr utover det API-et allerede oppgir (bekreftet
+    trygt ved stikkprøve: ekstra tittel-par er alltid reelle tilleggs-
+    matrikler, aldri feilaktige - se modul-docstring)."""
+    pairs = []
     for pid in property_identifications or []:
-        pair = (pid.get("propertyNr"), pid.get("useNr"))
-        if pair not in seen and pair[0] is not None and pair[1] is not None:
-            seen.append(pair)
-    if not seen:
+        gnr, bnr = pid.get("propertyNr"), pid.get("useNr")
+        if gnr is None or bnr is None:
+            continue
+        pair = f"{gnr}/{bnr}"
+        if pair not in pairs:
+            pairs.append(pair)
+    for pair in gnr_bnr_fra_tittel(tittel):
+        if pair not in pairs:
+            pairs.append(pair)
+    if not pairs:
         return None, None
-    gnr_bnr = "; ".join(f"{gnr}/{bnr}" for gnr, bnr in seen)
-    matrikkelnr = "; ".join(f"{KOMMUNE_NR}-{gnr}/{bnr}" for gnr, bnr in seen)
+    gnr_bnr = "; ".join(pairs)
+    matrikkelnr = "; ".join(f"{KOMMUNE_NR}-{p}" for p in pairs)
     return gnr_bnr, matrikkelnr
 
 
@@ -263,7 +320,16 @@ def gnr_bnr_matrikkel(property_identifications):
 # komma-baserte adresseparser som Trondheim bruker (_top_level_split,
 # _parse_address_parts, husnummer-validering) - se der for detaljerte
 # docstrings om hvorfor hvert steg finnes.
-_LEADING_MATRIKKEL = re.compile(r"^\d+/\d+(?:/\d+(?:/\d+)?)?\s+")
+# Matrikkelnr-prefikset kan gjentas (samme eller ulikt gnr/bnr restatert rett
+# etter det første, evt. i parentes og/eller skilt med " - "/" – " -
+# f.eks. "118/1748/0/0 (117/1723)  - Nordheimvegen 65 ..." eller
+# "70/66/0/0 70/66 - Eidhøgda 3, ..."). Matcher derfor ALLE slike ledende
+# gjentakelser i én omgang (+ i stedet for ett enkelt strip), ellers blir en
+# restatert matrikkel liggende igjen og korrumperer/blokkerer adressen som
+# følger (bekreftet på ekte data - se modul-docstring/rapport).
+_LEADING_MATRIKKEL = re.compile(
+    r"^(?:\(?\d+/\d+(?:/\d+(?:/\d+)?)?\)?\s+(?:[-–]\s+)?)+"
+)
 
 _NUM_LETTER_SPACE = re.compile(r"(\d+)\s+([A-Za-zæøåÆØÅ])\b")
 _TRAILING_PAREN = re.compile(r"(?:\s*\([^)]*\))+\s*$")
@@ -271,6 +337,19 @@ _TRAILING_MFL = re.compile(r"\s+(?:m\.?\s*fl\.?|med\s+flere)\s*$", re.IGNORECASE
 _INGEN_ADRESSE = re.compile(r"^ingen\s+adresse\b", re.IGNORECASE)
 _JUNK_LABELS = {"henvendelse", "tilsyn", "ingen registrering", "eiendom", "ingen adresse",
                 "ufordelte", "-"}
+# "Etikett + tallreferanse" som strukturelt ser ut som "Gatenavn husnummer"
+# (matcher _STREET_AND_NUMBER_RANGE) men er en vei-/plan-/programreferanse,
+# ikke en reell adresse - "Fylkesvei 7772"/"Fylkesveg 862" (fylkeskommunalt
+# veinummer), "Plan 1873"/"Reguleringsplan 717" (plan-id), "KIK 2025"
+# (tilskuddsprogram + årstall). Bekreftet ved full gjennomgang av samtlige
+# ~12500 poster i arkivet - 25 tilfeller, alle i denne kategorien, ingen
+# falske positiver (ekte gatenavn i arkivet starter aldri med disse ordene).
+_IKKE_ADRESSE_ETIKETT = re.compile(
+    r"^(?:fylkesvei|fylkesveg|riksvei|riksveg|europavei|europaveg|"
+    r"reguleringsplan|detaljregulering\w*|områderegulering\w*|"
+    r"kommunedelplan|plan|kik)\s+\d",
+    re.IGNORECASE,
+)
 
 TOKEN = r"\d+[A-Za-zæøåÆØÅ]?(?:\s*-\s*(?:\d+[A-Za-zæøåÆØÅ]?|[A-Za-zæøåÆØÅ]))?"
 _BARE_TOKEN_FULL = re.compile(rf"^{TOKEN}$")
@@ -278,6 +357,17 @@ _BARE_LETTER_TOKEN = re.compile(r"^[A-Za-zæøåÆØÅ]$")
 _STREET_AND_NUMBER_RANGE = re.compile(rf"^(.+?)\s+({TOKEN})$")
 _PART_SPLIT = re.compile(r"\s*(,|\bog\b)\s*")
 _STARTS_UPPER = re.compile(r"^[A-ZÆØÅ]")
+# Beskrivelsestekst starter noen ganger med stor bokstav også (norsk
+# heltsetning) og kan tilfeldigvis ende på et tall ("... nummer 2",
+# "... seksjon 1") - da matcher den ellers _STREET_AND_NUMBER_RANGE og
+# _STARTS_UPPER og blir feilaktig lest som en ny adresse i en komma-/og-liste.
+# Et midtstilt preposisjons-/beskrivelsesord er et pålitelig tegn på at det
+# IKKE er et ekte gatenavn (bekreftet: null falske positiver mot de 182 ekte
+# multi-adresse-tilfellene i arkivet) - samme prinsipp som Askers
+# _PREPOSISJON_MIDT/_DESCRIPTION_MARKERS.
+_DESCRIPTIVE_MIDTORD = re.compile(
+    r"\b(?:av|om|for|til|med|på|vedrørende|angående|nummer)\b", re.IGNORECASE
+)
 
 
 def _normalize_nummer_bokstav(s):
@@ -338,7 +428,8 @@ def _parse_address_parts(s):
                 last_number = mnum.group(1)
             continue
         sm = _STREET_AND_NUMBER_RANGE.match(part)
-        if sm and (sep is None or _STARTS_UPPER.match(sm.group(1).strip())):
+        if sm and (sep is None or (_STARTS_UPPER.match(sm.group(1).strip())
+                                    and not _DESCRIPTIVE_MIDTORD.search(sm.group(1)))):
             current_street = sm.group(1).strip()
             norm = re.sub(r"\s*-\s*", "-", sm.group(2))
             entries.append(f"{current_street} {norm}")
@@ -381,11 +472,17 @@ def extract_adresse(tittel):
             continue
         if _INGEN_ADRESSE.match(seg_stripped):
             return None
-        seg_proc = _truncate_at_separator_dash(seg_stripped)
-        cleaned = _TRAILING_PAREN.sub("", seg_proc).strip()
-        cleaned = _TRAILING_MFL.sub("", cleaned).strip()
+        # Trailing-parentes fjernes FØR bindestrek-trunkering: en " - " som
+        # ligger INNI en avsluttende parentes ("Nordheimvegen 63 (hus 1 -
+        # BKS4)") skal ikke tolkes som en bindestrek-separator mot
+        # beskrivelsen (det korrumperer/etterlater en ubalansert parentes,
+        # f.eks. "Nordheimvegen 63 (hus 1" - bekreftet på ekte data).
+        depaned = _TRAILING_PAREN.sub("", seg_stripped).strip()
+        seg_proc = _truncate_at_separator_dash(depaned)
+        cleaned = _TRAILING_MFL.sub("", seg_proc).strip()
         cleaned = cleaned.rstrip(" -").strip()   # fjern løs bindestrek-hale ("Presis Bolig AS -")
-        if cleaned and cleaned.lower() not in _JUNK_LABELS:
+        if (cleaned and cleaned.lower() not in _JUNK_LABELS
+                and not _IKKE_ADRESSE_ETIKETT.match(cleaned)):
             head = cleaned
             head_idx = idx
             break
@@ -575,7 +672,9 @@ def build_journalpost(journal):
 
 
 def build_sak(proceeding, journalposter, type_id, sakstype):
-    gnr_bnr, matrikkelnr = gnr_bnr_matrikkel(proceeding.get("propertyIdentifications"))
+    gnr_bnr, matrikkelnr = gnr_bnr_matrikkel(
+        proceeding.get("propertyIdentifications"), proceeding.get("title")
+    )
     saksnummer = proceeding.get("sequenceNumber")
     return {
         "identifier": proceeding.get("id"),
@@ -602,9 +701,9 @@ def parent_sak_ref(session, type_id, journal_proceeding_stub):
     seq = journal_proceeding_stub.get("sequenceNumber")
     full = fetch_proceeding_by_sequence_number(session, type_id, seq) if seq else None
     data = full or journal_proceeding_stub
-    gnr_bnr, matrikkelnr = gnr_bnr_matrikkel(data.get("propertyIdentifications"))
-    saksnummer = data.get("sequenceNumber")
     tittel = data.get("title")
+    gnr_bnr, matrikkelnr = gnr_bnr_matrikkel(data.get("propertyIdentifications"), tittel)
+    saksnummer = data.get("sequenceNumber")
     return {
         "identifier": data.get("id"),
         "kommune": KOMMUNE,

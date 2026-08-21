@@ -123,6 +123,14 @@ _NO_ADDRESS_PATTERNS = [
     "ulovlig ", "deltakelse i", "tverretatlig", "demografi", "konseptvalgutredning",
     "forslag om midlertidig forbud", "futurebuilt", "henvendelser til", "spørsmål til",
     "ingen adresse", "ukjent adresse", "forhåndskonferanse", "bestilling",
+    # Interne bygningsreferanser (heis/trapp-nummer), ikke et husnummer - uten
+    # denne blokkeres de ikke, og etter at kravet om husnummer ble strammet
+    # inn i _er_gyldig (se der) fortsetter extract_adresse forbi et bart
+    # stedsnavn utan tall (f.eks. "Sonja Henies plass") til et SENERE segment
+    # som feilaktig kvalifiserer via korttekst-fallbacken der (2 "ordentlige"
+    # ord + tall + stor forbokstav) - bekreftet: "Sonja Henies plass - Heis i
+    # trapp 1 - ..." ga "Heis i trapp 1" som adresse.
+    "heis i trapp", "løpenummer",
 ]
 # "li" er utelatt (for kort/generisk - matcher vanlige ord som "juli", ikke
 # bare gatenavn). "veita"/"lia"/"gangen"/"hellinga"/"sletta" er lagt til -
@@ -144,7 +152,15 @@ _STREET_TYPES = [
 ]
 
 _ORD_RE = re.compile(r"[a-zæøåéA-ZÆØÅÉ]+")
-_TRAILING_GBNR = re.compile(r"\s*-\s*\d+/\s*\d+\s*$")
+# Et gnr/bnr-par ("57/400") midt i kandidaten er ALLTID etterfulgt av
+# beskrivende tekst som ikke hører til adressen ("Badebakken 18, 57/400, snr.
+# 33 deles i to, ny seksjon 260", "Gamle Maridalsvei 1, Deling, eiendom 62/5,
+# se også 2024/04580") - gnr/bnr fanges uansett opp separat og uavhengig av
+# adressefeltet (se extract_gnr_bnr), så ALT fra og med "-"/","-et rett før
+# paret (inkl. et evt. enkelt ord som "eiendom"/"gnr" foran selve paret)
+# kastes, uansett hvor mye tekst som følger etter. ".*$" fanger opp resten av
+# kandidaten uansett lengde.
+_TRAILING_GBNR = re.compile(r"\s*[-,]\s*(?:[A-Za-zæøåÆØÅ]+\s+)?\d{1,4}/\s*\d{1,5}\b.*$")
 _MAKS_SEGMENTER = 5
 
 
@@ -202,8 +218,33 @@ _NR_BOKSTAV_MELLOMROM = re.compile(r"(\d)\s+([A-Za-zÆØÅæøå])\b")
 # Bruksendring - innredning..." eller "Diakonveien 9, Oslo - Gnr/Bnr-37/152"
 # gir ellers "Trondheimsveien 2, Bruksendring"/"Diakonveien 9, Oslo" som
 # adresse. Krever minst 2 bokstaver etter forbokstaven slik at en
-# enhetsliste med enkeltbokstav-suffikser ("18 A, B, C") IKKE trimmes bort.
-_TRAILING_ORD_ETTER_KOMMA = re.compile(r",\s*[A-ZÆØÅ][a-zæøå]{2,}$")
+# enhetsliste med enkeltbokstav-suffikser ("18 A, B, C") IKKE trimmes bort -
+# lengdekravet alene gir denne beskyttelsen uansett store/små bokstaver, så
+# forbokstaven trenger ikke være stor ("Ullern allé 41, grensepåvisning" -
+# "grensepåvisning" har liten forbokstav og skal likevel bort).
+_TRAILING_ORD_ETTER_KOMMA = re.compile(r",\s*[A-Za-zæøåÆØÅ][a-zæøå]{2,}$")
+# Et ledende sted-/prosjektnavn før komma, UTEN tall i den delen ("Bispevika
+# nord, Operagata 61 A mfl.", "Planforhåndskonferanse , Eikenga 4",
+# "Avkjørsel Reistad og Skjønhaug borettslag, Lindebergåsen 5 - 25"), er
+# aldri selve adressen - den står ETTER kommaet. Rammer ikke ekte
+# enhetslister ("18 A, B, C"), som alltid har et tall i FØRSTE del.
+_LEDENDE_NAVN_KOMMA = re.compile(r"^([^,\d]+),\s*(.+)$")
+# "Med flere"/"m.fl."/"mfl." markerer at saken gjelder FLERE adresser enn den
+# som er skrevet ut ("Karl Johans gate 24 med flere", "Nedre Skogvei 6D
+# m.fl.") - selve ordene er ikke en del av adressen.
+_TRAILING_MED_FLERE = re.compile(r"\s*(?:med\s+flere|m\.?\s*fl\.?)\s*$", re.IGNORECASE)
+# En avsluttende parentes er alltid en tilleggsopplysning (bygningsnavn,
+# tidligere adresse, ...), ikke en del av selve adressen - "Hoffsveien 40A
+# (Hoff gård)", "Sandstuveien 53A (tidligere Sandstuveien 53)".
+_TRAILING_PAREN = re.compile(r"\s*\([^()]*\)\s*$")
+# "Seksjon N" (eierseksjonsnummer) er ikke en del av gateadressen -
+# "Waldemar Thranes gate 60H, seksjon 73". _TRAILING_ORD_ETTER_KOMMA over
+# fanger ikke dette (krever stor forbokstav, "seksjon" er med liten s, og har
+# et tall etter seg, ikke bare et ord).
+_TRAILING_SEKSJON = re.compile(r",\s*seksjon\s*\d+\s*$", re.IGNORECASE)
+# "Tidligere <gammel adresse>" er en historisk henvisning, ikke en del av
+# dagens adresse - "Borgenveien 20J, tidligere 20B" er ÉN adresse, ikke to.
+_TRAILING_TIDLIGERE = re.compile(r",\s*tidligere\b.*$", re.IGNORECASE)
 
 
 def _rens_kandidat(kandidat):
@@ -212,9 +253,18 @@ def _rens_kandidat(kandidat):
         kandidat = kandidat.split("kommune - ", 1)[1].strip()
     if kandidat[:4].lower() == "ved ":
         kandidat = kandidat[4:].strip()
-    # Fjern en evt. hengende gnr/bnr-rest ("...16 - 196/69") - oppstår når et
-    # gnr/bnr-tall rett etter adressen feiltolkes som en fortsettelse av et
-    # tallspenn i _finn_skille (begge er rene tallpar).
+    navn_m = _LEDENDE_NAVN_KOMMA.match(kandidat)
+    if navn_m:
+        kandidat = navn_m.group(2).strip()
+    kandidat = _TRAILING_MED_FLERE.sub("", kandidat).strip()
+    kandidat = _TRAILING_PAREN.sub("", kandidat).strip()
+    kandidat = _TRAILING_SEKSJON.sub("", kandidat).strip()
+    kandidat = _TRAILING_TIDLIGERE.sub("", kandidat).strip()
+    # Fjern en evt. hengende gnr/bnr-rest ("...16 - 196/69", "...9C, 7/23") -
+    # oppstår når et gnr/bnr-tall rett etter adressen feiltolkes som en
+    # fortsettelse av et tallspenn i _finn_skille, eller bare blir stående
+    # etter et komma (begge er rene tallpar - se extract_gnr_bnr, som uansett
+    # fanger dem opp uavhengig av adressefeltet).
     kandidat = _TRAILING_GBNR.sub("", kandidat).strip()
     # Fjern et evt. hengende ord etter komma (se begrunnelse over).
     kandidat = _TRAILING_ORD_ETTER_KOMMA.sub("", kandidat).strip()
@@ -261,10 +311,15 @@ def _er_gyldig(kandidat):
             har_tall and len(ord_liste_reelle) <= 2 and kandidat[:1].isalpha() and kandidat[:1].isupper()
         ):
             return False
-    # Uten noe tall er kandidaten trolig et rent (kort) gatenavn - eller en
-    # hel beskrivelse-setning som tilfeldigvis inneholder et gatenavn-liknende
-    # ord et sted. Skiller på lengde.
-    if not har_tall and len(ord_liste) > 3:
+    # Uten noe tall er kandidaten ALDRI en gyldig adresse her - enten er det
+    # et bart gatenavn/stedsnavn uten husnummer ("Mosseveien", "Strømsveien"),
+    # eller en hel beskrivelse-setning som tilfeldigvis inneholder et
+    # gatetype-liknende ord et sted ("...Bylivsgata...", "...Tveita" - "Tveita"
+    # slutter tilfeldigvis på endelsen "veita"). Uten dette kravet slipper
+    # begge forbi via har_gatetype-grenen over, som aldri sjekket har_tall
+    # (bekreftet på 28 saker i full gjennomgang av arkivet, alle enten uten
+    # reell adresse eller et navngitt sted/gård uten husnummer).
+    if not har_tall:
         return False
     return True
 
@@ -291,11 +346,19 @@ _HUSNR_TOKEN = r"\d+[A-Za-zæøåÆØÅ]?(?:-(?:\d+[A-Za-zæøåÆØÅ]?|[A-Za-z
 # gatenavn, ikke et rent tall/spenn), og regexen gir opp - _utvid_flere_adresser
 # faller da videre til variant 2 (egne gate+nr-par), som splitter korrekt til
 # "Bjørnefaret 4; Grevlinglia 3".
+# Både komma-leddene OG det siste "og"-leddet kan være en BAR bokstav uten
+# tall ("18 A, B, C", "2R, S, T", "1A, B og C") - en fortsettelse av
+# bokstavsuffikset på FORRIGE tall, ikke et nytt husnummer. _HUSNR_TOKEN alene
+# (som krever et ledende tall) matcher ikke dette, derfor alternativet begge
+# steder - se rekonstruksjonen i _utvid_flere_adresser for hvordan bokstaven
+# kobles til det siste FULLE tallet i lista (ikke nødvendigvis forrige ledd,
+# som selv kan være en tidligere bar bokstav).
 _SAMME_GATE_LISTE_RE = re.compile(
     rf"^([A-ZÆØÅ][A-Za-zæøåÆØÅ.\- ]*?)\s+({_HUSNR_TOKEN})"
-    rf"((?:\s*,\s*{_HUSNR_TOKEN})*)"
-    rf"(?:\s+og\s+({_HUSNR_TOKEN}))?$"
+    rf"((?:\s*,\s*(?:{_HUSNR_TOKEN}|[A-Za-zæøåÆØÅ]))*)"
+    rf"(?:\s+og\s+({_HUSNR_TOKEN}|[A-Za-zæøåÆØÅ]))?$"
 )
+_GATE_LISTE_LEDD_RE = re.compile(rf"{_HUSNR_TOKEN}|[A-Za-zæøåÆØÅ]")
 _DEL_RE = re.compile(r"\s*,\s*|\s+og\s+")
 _GATE_NR_SEGMENT_RE = re.compile(rf"^[A-ZÆØÅ][\w.\-]*(?:\s[\w.\-]+)*\s{_HUSNR_TOKEN}$")
 
@@ -304,9 +367,19 @@ def _utvid_flere_adresser(kandidat):
     m = _SAMME_GATE_LISTE_RE.match(kandidat)
     if m:
         gate = m.group(1).strip()
-        tall = [m.group(2)] + [t.strip() for t in m.group(3).split(",") if t.strip()]
+        tall = [m.group(2)]
+
+        def _legg_til_ledd(ledd):
+            if re.fullmatch(r"[A-Za-zæøåÆØÅ]", ledd) and tall:
+                num_m = re.match(r"^(\d+)", tall[-1])
+                if num_m:
+                    ledd = f"{num_m.group(1)}{ledd}"
+            tall.append(ledd)
+
+        for ledd in _GATE_LISTE_LEDD_RE.findall(m.group(3)):
+            _legg_til_ledd(ledd)
         if m.group(4):
-            tall.append(m.group(4))
+            _legg_til_ledd(m.group(4))
         return "; ".join(f"{gate} {n}" for n in tall)
     deler = [d.strip() for d in _DEL_RE.split(kandidat) if d.strip()]
     if len(deler) >= 2 and all(_GATE_NR_SEGMENT_RE.match(d) for d in deler):

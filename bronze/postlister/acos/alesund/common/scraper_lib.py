@@ -288,17 +288,31 @@ def _finn_gnrbnr_blokk(segs):
     return start, end, gnr_bnr, matrikkel
 
 
+# Et navn på sameiet/borettslaget/eierselskapet rett foran selve gateadressen
+# i SAMME segment ("201/361 Sameiet Kipervikgata 23") er ikke en del av
+# adressen. Rammer kun navnet på selve eierformen, ikke et vanlig gatenavn.
+_LEDENDE_EIERFORM_RE = re.compile(
+    r"^(?:sameiet|sameie|borettslaget|burettslaget)\s+", re.IGNORECASE
+)
+
+
 def _finn_gnrbnr_blokk_lopende(segs):
     """Løs fallback: token FØRST i et segment, med mer fri tekst i SAMME
-    segment ("Gbnr 12/045 Nytt bygg", uten skilletegn - typisk Sandøy)."""
+    segment ("Gbnr 12/045 Nytt bygg", uten skilletegn - typisk Sandøy).
+    Returnerer i tillegg resten av segmentet etter selve tallet/tallene
+    ("Sameiet Kipervikgata 23" fra "201/361 Sameiet Kipervikgata 23") - uten
+    denne gikk adressen i SAMME segment som gnr/bnr-tallet helt tapt, siden
+    _adresse_fra_blokk kun ser på segmenter ETTER denne blokken, aldri
+    resten av selve blokk-segmentet."""
     for i, seg in enumerate(segs):
         kandidat = _PAREN_RE.sub("", seg.strip())
         m = _LEADING_TOKEN_RE.match(kandidat)
         if m:
             gnr_bnr, matrikkel = _parse_gnrbnr_expr(m.group(1))
             if gnr_bnr:
-                return i, i, gnr_bnr, matrikkel
-    return None, None, None, None
+                rest = _LEDENDE_EIERFORM_RE.sub("", kandidat[m.end():].strip()).strip()
+                return i, i, gnr_bnr, matrikkel, rest
+    return None, None, None, None, None
 
 
 _HAS_DIGIT_RE = re.compile(r"\d")
@@ -312,8 +326,19 @@ _SPACED_PAIR_RE = re.compile(r"^(.+?)\s+(\d+[A-Za-zæøåÆØÅ]?)\s+-\s+(\d+[A-
 # tall"-sjekk ikke er nok. Krever i stedet at kandidaten SLUTTER på et
 # husnummer-mønster, og forkaster eksplisitt saksreferanser på "N/N"-form i
 # enden (ekte husnummer skrives aldri slik).
-_ENDS_WITH_HUSNR_RE = re.compile(r"\d+\s?[A-Za-zæøåÆØÅ]?\s*$")
+#
+# Tallet MÅ stå som et eget "ord" - dvs. være foran av tekststart eller
+# mellomrom, ikke klistret rett på foregående bokstaver uten mellomrom. Uten
+# dette kravet godtas felt-/reguleringskoder som "BK2"/"KS1" (bokstaver
+# FØRST, så tall - motsatt av et ekte husnummer, som alltid er tall FØRST,
+# evt. med ÉN bokstav etter, "20J"/"18A") som om siste tallet i dem var et
+# reelt husnummer - bekreftet falskt positiv: "Ratvika BK2" ble godtatt som
+# adresse.
+_ENDS_WITH_HUSNR_RE = re.compile(r"(?:^|\s)\d+\s?[A-Za-zæøåÆØÅ]?\s*$")
 _ENDS_WITH_SAKSREF_RE = re.compile(r"\d+\s*/\s*\d+\s*$")
+# En ledende klage-/beskrivelsesfrase foran selve gateadressen ("Ulempe for
+# Kaptein Lingesveg 90") er ikke en del av adressen.
+_LEDENDE_BESKRIVELSE_RE = re.compile(r"^ulempe\s+for\s+", re.IGNORECASE)
 
 
 def _utvid_flere_adresser(adresse):
@@ -333,6 +358,7 @@ def _ferdigstill_adresse(adresse):
     if not adresse:
         return None
     adresse = adresse.strip().strip(",.;:").strip()
+    adresse = _LEDENDE_BESKRIVELSE_RE.sub("", adresse).strip()
     if not adresse:
         return None
     if _ENDS_WITH_SAKSREF_RE.search(adresse):
@@ -344,12 +370,20 @@ def _ferdigstill_adresse(adresse):
 
 
 def _adresse_fra_blokk(segs, start, end):
+    """Ørskog skriver noen ganger "Gbnr X/Y - beskrivelse - adresse" i
+    stedet for den vanlige "Gbnr X/Y - adresse - beskrivelse"-rekkefølgen
+    (f.eks. "Gbnr 89/5 - Tilbygg og bruksendring - Giskemovegen 76",
+    verifisert mot ekte data) - prøver derfor ALLE segmenter etter
+    gnr/bnr-blokken (ikke bare det første) og returnerer det første som
+    faktisk består adressevalideringen (_ferdigstill_adresse), i stedet for
+    å gi opp på et første, ugyldig kandidatsegment."""
     if start > 0:
         return " - ".join(segs[:start])
     for kandidat in segs[end + 1:]:
         if _er_gnrbnr_segment(kandidat):
             continue
-        return kandidat
+        if _ferdigstill_adresse(kandidat):
+            return kandidat
     return None
 
 
@@ -406,19 +440,19 @@ def _finn_gnrbnr_blokk_innbakt(segs):
     return None, None, None
 
 
-def parse_adresse_generisk(tittel, subtitle=None, gnr_offset=0):
-    """Standardparser for alesund_2024/alesund_2020_2023/alesund_2010_2019
-    (og førsteforsøk for orskog_hist), se modul-docstring.
-    gnr_offset: fast tillegg på gnr-delen, brukt av pre-2020-arkivene som
-    har sin egen gamle gnr-numrering (se _med_gnr_offset)."""
+def _parse_adresse_generisk_indre(tittel, gnr_offset=0):
     segs = _split_tittel(tittel)
     if not segs:
         return None, None, None
+    rest_i_segment = None
     start, end, gnr_bnr, matrikkel = _finn_gnrbnr_blokk(segs)
     if start is None:
-        start, end, gnr_bnr, matrikkel = _finn_gnrbnr_blokk_lopende(segs)
+        start, end, gnr_bnr, matrikkel, rest_i_segment = _finn_gnrbnr_blokk_lopende(segs)
     if start is not None:
-        adresse = _ferdigstill_adresse(_adresse_fra_blokk(segs, start, end))
+        adresse_kandidat = _adresse_fra_blokk(segs, start, end)
+        if not adresse_kandidat and rest_i_segment:
+            adresse_kandidat = rest_i_segment
+        adresse = _ferdigstill_adresse(adresse_kandidat)
         if gnr_offset and gnr_bnr:
             gnr_bnr, matrikkel = _med_gnr_offset(gnr_bnr, gnr_offset), _med_gnr_offset(matrikkel, gnr_offset)
         return adresse, (gnr_bnr or None), _matrikkelnr(matrikkel)
@@ -431,6 +465,30 @@ def parse_adresse_generisk(tittel, subtitle=None, gnr_offset=0):
     return adresse, (gnr_bnr or None), _matrikkelnr(matrikkel)
 
 
+def parse_adresse_generisk(tittel, subtitle=None, gnr_offset=0):
+    """Standardparser for alesund_2024/alesund_2020_2023/alesund_2010_2019
+    (og førsteforsøk for orskog_hist), se modul-docstring.
+    gnr_offset: fast tillegg på gnr-delen, brukt av pre-2020-arkivene som
+    har sin egen gamle gnr-numrering (se _med_gnr_offset).
+
+    Siste fallback (etter _parse_adresse_generisk_indre): et rent
+    "Gnr NN bnr NN"-format UTEN skråstrek ("Gnr.118 bnr. 976") - Ørskogs
+    hovedformat (se modul-docstring), men forekommer sjeldnere også i de
+    andre kildene og fanges derfor her, ikke bare i parse_adresse_orskog."""
+    adresse, gnr_bnr, matrikkel = _parse_adresse_generisk_indre(tittel, gnr_offset=gnr_offset)
+    if gnr_bnr:
+        return adresse, gnr_bnr, matrikkel
+    m = _GNR_BNR_LABELED_RE.search(tittel or "")
+    if not m:
+        return None, None, None
+    normalisert = tittel[:m.start()] + f"Gbnr {m.group(1)}/{m.group(2)}" + tittel[m.end():]
+    adresse, gnr_bnr, matrikkel = _parse_adresse_generisk_indre(normalisert, gnr_offset=gnr_offset)
+    if gnr_bnr:
+        return adresse, gnr_bnr, matrikkel
+    par = f"{int(m.group(1)) + gnr_offset}/{_avpad(m.group(2))}"
+    return None, [par], _matrikkelnr([par])
+
+
 # --------------------------------------------------------------------------- #
 # Ørskog - blander inn et eget "Gnr NN bnr NN"-format (se modul-docstring)
 # --------------------------------------------------------------------------- #
@@ -440,22 +498,11 @@ _GNR_BNR_LABELED_RE = re.compile(r"[Gg]nr\.?\s*(\d+)\s*[Bb]nr\.?\s*(\d+)")
 def parse_adresse_orskog(tittel, subtitle=None):
     """Ørskog 2009-2019 - se modul-docstring. Legger Kartverket sitt faste
     +600-gnr-offset på alt som finnes (se _med_gnr_offset), siden titlene
-    bruker den gamle Ørskog-kommunens egen gnr-numrering."""
-    adresse, gnr_bnr, matrikkel = parse_adresse_generisk(tittel, gnr_offset=600)
-    if gnr_bnr:
-        return adresse, gnr_bnr, matrikkel
-    m = _GNR_BNR_LABELED_RE.search(tittel or "")
-    if not m:
-        return None, None, None
-    normalisert = tittel[:m.start()] + f"Gbnr {m.group(1)}/{m.group(2)}" + tittel[m.end():]
-    adresse, gnr_bnr, matrikkel = parse_adresse_generisk(normalisert, gnr_offset=600)
-    if gnr_bnr:
-        return adresse, gnr_bnr, matrikkel
-    # Siste fallback: ingen adresse funnet i det hele tatt (f.eks.
-    # "Tilsynsrapport gnr 97 bnr 358", uten skilletegn mot resten av
-    # tittelen) - behold i det minste selve gnr/bnr-paret (med offset).
-    par = f"{int(m.group(1)) + 600}/{_avpad(m.group(2))}"
-    return None, [par], _matrikkelnr([par])
+    bruker den gamle Ørskog-kommunens egen gnr-numrering. Det "Gnr NN bnr
+    NN"-formatet uten skråstrek som er hovedformen her, håndteres nå av
+    parse_adresse_generisk sin egen fallback (samme mekanisme, delt med de
+    andre kildene) - denne funksjonen er bare en tynn wrapper for offset."""
+    return parse_adresse_generisk(tittel, gnr_offset=600)
 
 
 def parse_adresse_sandoy(tittel, subtitle=None):

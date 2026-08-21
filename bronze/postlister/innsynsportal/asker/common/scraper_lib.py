@@ -353,7 +353,16 @@ def gnr_bnr_matrikkel(property_identifications, tittel=None):
         if utvidelser:
             fra_tittel = True   # flagget reflekterer matrikkelnr, ikke bare gnr_bnr
             for feste, seksjon in utvidelser:
-                matrikkel_parts.append(f"{KOMMUNE_NR}-{gnr}/{bnr}/{feste}/{seksjon}")
+                # feste kan finnes uten seksjon (tittelen har bare 3 ledd,
+                # "210/1/36") - IKKE skriv "/None" i så fall (bekreftet bug
+                # på ekte data, 145 rammede saker - se rapport). Tar med
+                # kun de leddene som faktisk finnes.
+                delnr = [str(gnr), str(bnr)]
+                if feste is not None:
+                    delnr.append(str(feste))
+                if seksjon is not None:
+                    delnr.append(str(seksjon))
+                matrikkel_parts.append(f"{KOMMUNE_NR}-" + "/".join(delnr))
         else:
             matrikkel_parts.append(f"{KOMMUNE_NR}-{gnr}/{bnr}")
     matrikkelnr = "; ".join(matrikkel_parts)
@@ -399,12 +408,19 @@ _DESCRIPTION_MARKERS = re.compile(
     r"ingen\s+adresse|ukjent\s+adresse)\b",
     re.IGNORECASE,
 )
-# Sakstype-/beskrivelsessetninger har ofte en preposisjon i midten
-# ("Begjæring OM innsyn", "Retting I matrikkel", "Utskifting AV vannkum") -
-# ekte gatenavn i arkivet har det aldri (bekreftet: null falske positiver
-# mot samtlige stedsnavn funnet i stikkprøven). Fanger opp beskrivelses-
-# setninger som ikke starter med noe i _DESCRIPTION_MARKERS over.
-_PREPOSISJON_MIDT = re.compile(r"\b(?:om|av|til|fra|for|med|på|mot|i)\b", re.IGNORECASE)
+# En reell adresse har alltid et husnummer (se modul-docstring: formatet er
+# "gnr/bnr[...] Adresse - Beskrivelse", f.eks. "Fabrikkveien 34"). Uten noe
+# tall i det hele tatt er kandidaten typisk en beskrivelsessetning ("Retting
+# i matrikkel", "Nytt bygg", "Sikringstiltak etter stormflo"), et bart
+# gatenavn uten nummer ("Kjøyafaret", "Kirkeveien"), et sted-/anleggsnavn
+# ("Dikemark sykehus", "Holtnes brygge") eller en kryssbeskrivelse ("Krysset
+# Nyveien / Bergeråsen") - ingen av disse er en reell adresse (bekreftet ved
+# full gjennomgang av samtlige 750 tallfrie kandidater i hele Asker-arkivet).
+# ETT unntak: et gårdsnavn ("Eltorn gård", "Asker prestegård", "Søndre
+# Nærsnes Hovedgård") ER i Norge en gyldig postadresse uten husnummer -
+# fanges av _GARDSNAVN_UTEN_NUMMER (9 forekomster i arkivet, alle reelle
+# gårder, verifisert mot ekte data).
+_GARDSNAVN_UTEN_NUMMER = re.compile(r"\b(?:gård|prestegård|hovedgård)\s*$", re.IGNORECASE)
 
 _OG_SPLIT = re.compile(r"^(.+?)\s+og\s+(.+)$")
 _BARE_NUMBER_SUFFIX = re.compile(r"^\d+[A-Za-zæøåÆØÅ]?$")
@@ -444,11 +460,11 @@ def _clean_adresse(kandidat):
         return None
     if _DESCRIPTION_MARKERS.match(s):
         return None
-    # Uten tall er kandidaten ofte en hel beskrivelsessetning som tilfeldigvis
-    # ikke starter med noe i _DESCRIPTION_MARKERS ("Retting i matrikkel",
-    # "Utskifting av vannkum") - en midtstilt preposisjon er et pålitelig
-    # tegn på det (se _PREPOSISJON_MIDT), ekte gatenavn har aldri dette.
-    if not re.search(r"\d", s) and _PREPOSISJON_MIDT.search(s):
+    # En reell adresse har alltid et husnummer - uten tall er kandidaten
+    # enten en beskrivelsessetning, et bart gatenavn, et sted-/anleggsnavn
+    # eller en kryssbeskrivelse, ikke en reell adresse (se
+    # _GARDSNAVN_UTEN_NUMMER over for det ene bekreftede unntaket).
+    if not re.search(r"\d", s) and not _GARDSNAVN_UTEN_NUMMER.search(s):
         return None
     return _split_og_adresser(s)
 

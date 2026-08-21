@@ -120,12 +120,59 @@ _NO_ADDRESS_PATTERNS = [
 # motsetning til _NO_ADDRESS_PATTERNS over) selv kan ende i et tall og dermed
 # ellers ville sluppet gjennom _ENDS_WITH_HUSNR - typisk en byggearbeid-
 # beskrivelse som tilfeldigvis ender i en tallreferanse ("Støpt båtopptrekk
-# foran naust 2", "Riving av garasje 3"), ikke en adresse.
+# foran naust 2", "Riving av garasje 3"), ikke en adresse. "rammesøknad" er
+# lagt til etter funn i ekte data: "Rammesøknad 1 - Langstranda - ..." ble
+# feilaktig godkjent som adressen "Rammesøknad 1" (tallet er søknadens
+# løpenummer, ikke et husnummer - Langstranda i samme tittel har uansett
+# ikke noe husnummer å hente ut).
 _GENERISKE_STARTORD = {
     "støpt", "støp", "riving", "nytt", "graving", "sprengning", "montering",
     "oppføring", "etablering", "utbedring", "oppgradering", "tilbygg", "påbygg",
-    "bygging", "oppussing", "rehabilitering",
+    "bygging", "oppussing", "rehabilitering", "rammesøknad",
+    # Funnet ved full gjennomgang av arkivet (se rapport): hver av disse er et
+    # eget, ikke-adresse-ord som likevel strukturelt ser ut som "gatenavn +
+    # husnummer" (stor forbokstav, slutter i et tall) - "Eiendom 2020" er et
+    # firmanavn ("Eiendom 2020 - Fridtjof Nansens vei 11" - den reelle
+    # adressen står i et SENERE segment), "Årsrapport ... 2021" og
+    # "Jernbaneparsell 2" er henholdsvis en rapporttittel og en jernbane-
+    # arealreferanse, ikke en postadresse.
+    "eiendom", "årsrapport", "jernbaneparsell", "kunstprosjekt",
+    "detaljreguleringsplan", "reguleringsplan", "kommunedelplan", "områdereguleringsplan",
 }
+# "Tomt 7"/"Rorbuveien tomt 1"/"Naurstad seksjon 10"/"Jensvolldalen Byggetrinn 3"/
+# "Rønvik Terrasse Borettslag nr 10"/"Bygn.nr. 300218084" - en tomte-/
+# seksjons-/byggetrinn-/borettslagsenhets-/bygningsregisternummerering er en
+# intern prosjekt-/matrikkel-/registerreferanse, ikke et tildelt husnummer,
+# når det er det ENESTE tallet i kandidaten (ingen egen gateadresse med eget
+# nummer foran). Til forskjell fra f.eks. "Jordbruksveien 21B, seksjon 8" der
+# "seksjon 8" bare er en ekstra presisering ETTER en allerede reell adresse
+# (har sitt eget tall "21" før "seksjon") - den skal IKKE rammes, og rammes
+# heller ikke: sjekken under ser kun etter tall FØR selve etiketten. "tont"
+# er en bekreftet skrivefeil for "tomt" i ett tilfelle i arkivet.
+_TOMT_SEKSJON_BYGGETRINN = re.compile(
+    r"\b(?:tomt|tont)(?:\s+nr\.?)?\b|\b(?:seksjon|byggetrinn|borettslag|bygn\.?\s*nr\.?|bygningsnr\.?)\b",
+    re.IGNORECASE,
+)
+# Et bart telefoni-/anleggsmastnummer ("NR1412", "BODØ-ALSOS-NR1232" - Telenor
+# Infra sin site-navngivning) - ALDRI en postadresse, men ser strukturelt
+# gyldig ut (stor forbokstav, slutter i tall). Fanger KUN "nr" som står helt
+# FØRST i kandidaten eller RETT etter en bindestrek - "Vei 1571 nr 27" (en
+# reell adresse - se modul-docstring om "Vei N nr M"-konvensjonen) har alltid
+# et mellomrom foran "nr", ikke en bindestrek eller kandidat-start, og rammes
+# derfor ikke.
+_NR_KODE_REFERANSE = re.compile(r"(?:^|-)\s*nr\.?\s*\d+\s*$", re.IGNORECASE)
+# Et bart "<én bokstav><tall>" uten mellomrom og uten noe gatenavn foran
+# ("L42") er en intern tomte-/enhetskode, ikke en gateadresse - ingen reell
+# Bodø-adresse i arkivet er kortere enn et flerbokstavs gatenavn + tall.
+_BART_BOKSTAV_TALL = re.compile(r"^[A-Za-zæøåÆØÅ]\d+[A-Za-zæøåÆØÅ]?$")
+# "G.nr. 47/102"/"gbnr. 117/118" er en matrikkelreferanse (dekket av
+# extract_gnr_bnr), ikke en gateadresse, men kan likevel se strukturelt
+# gyldig ut for _er_gyldig (stor forbokstav + slutter i et tall) - bekreftet
+# feilaktig godkjent i ekte data uten denne sjekken. Ingen reell Bodø-adresse
+# i datasettet bruker "/" i husnummeret (kun "-" for spenn, se
+# _HUSNR_TOKEN/_split_multi_adresse), så et bart tallpar med skråstrek er et
+# trygt kjennetegn på en matrikkelreferanse, ikke et husnummer.
+_GBNR_REFERANSE_RE = re.compile(r"\bg\.?\s*bnr\.?\b|\bg\.?\s*nr\.?\b|\d+\s*/\s*\d+", re.IGNORECASE)
 
 _TRAILING_GBNR = re.compile(r"\s*-\s*\d+/\s*\d+\s*$")
 # Saksnummer ("YYYY/NNNNN") limt rett inntil adressen uten eget skille, f.eks.
@@ -190,6 +237,13 @@ _TRAILING_PAREN = re.compile(r"\s*\([^)]*\)\s*$")
 # kommaet valideres videre. Adresselister som "Sundveien 18A, B, C" har
 # derimot ALLTID et tall i den første kommadelen og rammes ikke av dette.
 _LEADING_NAVN_KOMMA = re.compile(r"^([^,\d]+),\s*(.+)$")
+# Trailing "Plan N" (bygningens etasje/plan, f.eks. "Helliesens gate 16,
+# Plan 2") er ikke en del av selve adressen og strukturelt ser den ellers ut
+# som en HELT EGEN gate+nr-adresse ("Plan 2") - uten denne strippingen
+# feiltolkes den som en andre, separat adresse av _split_ulike_gater
+# (bekreftet i ekte data - se rapport). Fjernes på samme måte som
+# _TRAILING_GBNR, FØR resten av kandidaten valideres/splittes videre.
+_TRAILING_PLAN = re.compile(r",?\s*\bPlan\s+\d+[A-Za-zæøåÆØÅ]?\s*$", re.IGNORECASE)
 
 
 def _rens_kandidat(kandidat):
@@ -211,6 +265,7 @@ def _rens_kandidat(kandidat):
     if navn_m:
         kandidat = navn_m.group(2).strip()
     kandidat = _TRAILING_GBNR.sub("", kandidat).strip()
+    kandidat = _TRAILING_PLAN.sub("", kandidat).strip()
     kandidat = _TRAILING_PAREN.sub("", kandidat).strip()
     kandidat = _TRAILING_ORD_ETTER_KOMMA.sub("", kandidat).strip()
     kandidat = _NR_BOKSTAV_MELLOMROM.sub(r"\1\2", kandidat)
@@ -232,6 +287,43 @@ _ENDS_WITH_HUSNR = re.compile(r"(\d+\s?[A-Za-zæøåÆØÅ]?|(?:og|,)\s+[A-Za-z�
 # felt B2-1", se feilrapport). \b...\b treffer IKKE sammensatte ord som
 # "boligfelt", bare det bare, frittstående ordet "felt".
 _INNEHOLDER_FELT = re.compile(r"\bfelt\b", re.IGNORECASE)
+# Et bart veinummer ("Rv. 80", "Riksvei 80", "Fylkesvei 7772") er en
+# fylkes-/riksveireferanse, ikke en postadresse - strukturelt identisk med
+# "felt B2-1"-problemet over (ender i et tall, ser ellers gyldig ut). Fanger
+# KUN når ordet står FØRST i kandidaten - "Gamle Riksvei 1" er derimot en
+# reell, egen gatenavn-konvensjon i Bodø (flere bekreftede forekomster i
+# arkivet) og skal IKKE rammes, se docstring for _finn_skille-familien.
+_VEINUMMER_REFERANSE = re.compile(
+    r"^(?:e\d+|rv\.?|fv\.?|riksvei|riksveg|fylkesvei|fylkesveg|europavei|europaveg)\s*\d",
+    re.IGNORECASE,
+)
+# "kapittel N" (lovhenvisning, f.eks. "forurensingsforskriften kapittel 7") er
+# en paragraf-/kapittelreferanse, ikke en postadresse - ser strukturelt gyldig
+# ut for _ENDS_WITH_HUSNR (stor forbokstav + slutter i et tall) på samme måte
+# som "felt"/"tomt" over. Bekreftet i ekte data: "Høring - Forslag til
+# endringer forurensingsforskriften kapittel 7" ble feilaktig godkjent som
+# adressen "Forslag til endringer forurensingsforskriften kapittel 7".
+_INNEHOLDER_KAPITTEL = re.compile(r"\bkapittel\b", re.IGNORECASE)
+# Et tall etterfulgt av bar "m"/"m2"/"m²" er en meter-/areal-enhet ("nærmere
+# vei enn 4 m", "høyde over 5 m"), ikke et husnummer med bokstavsuffiks - ser
+# likevel strukturelt gyldig ut for _ENDS_WITH_HUSNR (_rens_kandidat har da
+# allerede fjernet mellomrommet: "4 m" -> "4m", se _NR_BOKSTAV_MELLOMROM).
+# Bekreftet i ekte data: "Dispensasjon for bygging nærmere vei enn 4 m -
+# Nordland Fylkeskommune - Amtmann Hegges vei 4" ga feilaktig adressen
+# "Dispensasjon for bygging nærmere vei enn 4m" i stedet for å gå videre til
+# det senere, reelle segmentet "Amtmann Hegges vei 4". Ingen reell Bodø-
+# adresse i arkivet bruker bokstaven "M" som husnummersuffiks.
+_TRAILING_METER_ENHET = re.compile(r"\dm[²2]?\s*$", re.IGNORECASE)
+# "Vei 1567" er internnummereringen til ett bestemt privat utbyggingsprosjekt
+# (Bodøsjøveien Eiendom AS' seksjonering av tomter langs sin egen vei) - alle
+# forekomster i arkivet er enten en seksjoneringssak med et tallSPENN ("nr
+# 19-47") eller (bekreftet i feilrapport) en enkelt tomt/enhet uten noen egen
+# navngitt gate, til forskjell fra de øvrige "Vei N nr M"-veinumrene i
+# arkivet, som konsekvent er ekte, navngitte offentlige adresser for
+# spredtbygde eiendommer. Se modul-docstring for den generelle "Vei N nr
+# M"-konvensjonen, som IKKE rammes av dette - kun dette ene, bekreftede
+# unntaket.
+_KJENTE_INTERNE_VEINUMRE = re.compile(r"^vei\s+1567\s+nr\s+\d+", re.IGNORECASE)
 
 
 def _er_gyldig(kandidat):
@@ -244,6 +336,23 @@ def _er_gyldig(kandidat):
     if ord_liste and ord_liste[0].strip(".,:;") in _GENERISKE_STARTORD:
         return False
     if _INNEHOLDER_FELT.search(lav):
+        return False
+    if _INNEHOLDER_KAPITTEL.search(lav):
+        return False
+    if _TRAILING_METER_ENHET.search(kandidat):
+        return False
+    if _KJENTE_INTERNE_VEINUMRE.match(kandidat):
+        return False
+    if _GBNR_REFERANSE_RE.search(kandidat):
+        return False
+    if _VEINUMMER_REFERANSE.match(kandidat):
+        return False
+    if _NR_KODE_REFERANSE.search(kandidat):
+        return False
+    if _BART_BOKSTAV_TALL.match(kandidat):
+        return False
+    m = _TOMT_SEKSJON_BYGGETRINN.search(kandidat)
+    if m and not re.search(r"\d", kandidat[: m.start()]):
         return False
     if not _STARTS_UPPER.match(kandidat):
         return False
@@ -341,7 +450,17 @@ def extract_adresse(sakstittel):
     """Prøver segment for segment (skilt ved _finn_skille) til ett gir en
     gyldig adresse, eller til tittelen er tom for flere segmenter. En
     kandidat med flere husnummer ("Sneveien 71 og 73") utvides til flere
-    "; "-adskilte adresser via _split_multi_adresse før den returneres."""
+    "; "-adskilte adresser via _split_multi_adresse før den returneres.
+
+    En kandidat kan i tillegg ha en reell adresse i sin FØRSTE kommadel, med
+    et stedsnavn/bygningsnavn (ikke en adressefortsettelse) etter kommaet -
+    f.eks. "Sjøgata 31A, Ombygging for Heimtex" eller "Tverlandsveien 50,
+    Tverlandet Skole". Da feiler HELE kandidaten _er_gyldig (den slutter i
+    stedsnavnet, ikke et husnummer), selv om adressen står helt i klartekst
+    innledningsvis - prøv derfor komma-delen FØR som fallback. Trygt: dette
+    prøves bare når HELE kandidaten allerede har feilet, så en ekte
+    adresseliste ("Sundveien 18A, B, C", som validerer helhetlig) rammes
+    aldri av dette - se _split_multi_adresse for den logikken."""
     if not sakstittel:
         return None
     gjenstaende = sakstittel
@@ -350,6 +469,11 @@ def extract_adresse(sakstittel):
         kandidat = _rens_kandidat(head)
         if _er_gyldig(kandidat):
             return _split_multi_adresse(kandidat)
+        forste_del, komma, _etter = kandidat.partition(",")
+        if komma:
+            forste_del = forste_del.strip()
+            if _er_gyldig(forste_del):
+                return _split_multi_adresse(forste_del)
         if not rest.strip():
             break
         gjenstaende = rest
@@ -363,16 +487,61 @@ def extract_adresse(sakstittel):
 # å unngå dobbelttelling og feiltolkning av "N bnr. N" som et vanlig tallpar.
 _GNR_BNR_RE = re.compile(r"\b(\d{1,4})/(\d{1,5})\b")
 _GNR_BNR_LABELED_RE = re.compile(r"[Gg]nr\.?\s*(\d{1,4})\s*[Bb]nr\.?\s*(\d{1,5})")
-_GNR_BNR_AARSTALL_MIN, _GNR_BNR_AARSTALL_MAKS = 2010, 2099
+# Nedre grense senket fra 2010 til 1900 (se rapport): ekte gnr i Bodø er
+# bekreftet aldri over 138 (merket "Gnr N bnr M"-stikkprøve), mens et bart
+# tallpar der "gnr"-tallet er 1900-2099 er alltid et årstall (enten en reell
+# byggeaar-referanse i tittelen, eller - langt oftere - et gammelt sak-
+# nummer fra før eInnsyn-migreringen, f.eks. "2001/16", "07/3905", "2004/6607"
+# - se modul-docstring). Det gamle 2010-taket fanget kun DELVIS av disse
+# (f.eks. slapp "2004/6607", "2006/3591", "2009/1620" gjennom som falske
+# gnr/bnr-treff før denne utvidelsen).
+_GNR_BNR_AARSTALL_MIN, _GNR_BNR_AARSTALL_MAKS = 1900, 2099
 _GNR_BNR_BLOKKORD = {
     "sak", "saken", "saka", "byggesak", "byggesaken", "arkivsak",
     "arkivsaken", "spørsmål", "referanse", "ref", "anlnr", "journalpost",
 }
 _ORD_FOR_TALLPAR_RE = re.compile(r"([a-zæøåA-ZÆØÅ]+)[:\s]*$")
+# Et tallpar limt DIREKTE til et gatenavn med et vanlig gate-endelsesord rett
+# før ("Sjøgata 41/43", "Jordbruksveien 48/50", "Steinvollveien 61/63") er et
+# kombinert husnummerpar (samme adressekonvensjon som Fredrikstads "Mosseveien
+# 51/53") - IKKE et gnr/bnr-par, selv om det strukturelt ser identisk ut.
+# Bekreftet i ekte data: 19 slike treff, samtlige med et gatenavn endt på
+# "-vei(en)/-veg(en)/-gat(e/a)" rett foran paret (til forskjell fra ekte
+# gnr/bnr, som alltid står etter en bindestrek/komma/"og", aldri limt til et
+# vanlig gateord).
+_GATE_ENDELSE_RE = re.compile(r"(?:vei|veien|vegen|veg|gate|gata|gaten)$", re.IGNORECASE)
 # Fullt matrikkelnummer ("knr-gnr/bnr/festenr/seksjonsnr", f.eks.
 # "1804-138/4792/0/0") - festenr/seksjonsnr-halene må ikke tolkes som egne,
 # ekstra gnr/bnr-par. Maskes bort først.
 _MATRIKKELNR_FULL_RE = re.compile(r"\b\d{4}-(\d{1,4})/(\d{1,5})(?:/\d{1,5})*\b")
+# Et tallpar som står som SITT EGET, isolerte bindestrek-segment helt til
+# slutt i tittelen ("... - Elias Blix vei 16 - 10/9473"), UTEN "Gnr"/"bnr"-
+# etikett, er nesten alltid en henvisning til et gammelt (pre-eInnsyn)
+# saksnummer, IKKE et gnr/bnr-par - bekreftet ved full gjennomgang: 1082
+# treff der tittelen ALLEREDE har en fullt utledet reell adresse et annet
+# sted, og der samme adresse/eier gir et ULIKT tallpar fra sak til sak
+# ("Elias Blix vei 16" -> 10/9473 i én sak, 10/9049 i en annen samme dag) -
+# beviser at paret ikke kan være en stabil eiendoms-gnr/bnr (den endrer seg
+# jo ikke fra sak til sak for samme hus). Matcher også modul-docstringens
+# egne eksempler på gamle saksnummer i klartekst ("2001/16", "07/3905",
+# "09/4906"). Ekte, umerket gnr/bnr brukes i arkivet KUN når tittelen
+# IKKE ellers har noen adresse (typisk for landemerker uten gatenummer,
+# f.eks. "Hurtigbåtkaia ... - 138/1346") - denne masken slår derfor bare inn
+# når _rest_har_adresse() under bekrefter en reell adresse i resten av
+# tittelen, for å ikke risikere å fjerne ekte data i den mer usikre klassen.
+_TRAILING_SAKSNR_REFERANSE = re.compile(r"-\s*(\d{1,4})\s*/\s*(\d{1,6})\s*$")
+
+
+def _er_isolert_sakstallpar(maskert, match):
+    """True hvis match (et _TRAILING_SAKSNR_REFERANSE-treff) er en gammel
+    saksnummer-henvisning som trygt kan maskeres bort - dvs. IKKE rett etter
+    en gnr/bnr-etikett, OG resten av tittelen (uten dette segmentet) allerede
+    gir en reell, gyldig adresse på egen hånd (se konstant-docstring over)."""
+    kontekst = maskert[max(0, match.start() - 15): match.start()]
+    if re.search(r"gnr|bnr|gbnr", kontekst, re.IGNORECASE):
+        return False
+    rest = maskert[: match.start()].rstrip(" -")
+    return bool(extract_adresse(rest))
 
 
 def extract_gnr_bnr(sakstittel):
@@ -397,13 +566,27 @@ def extract_gnr_bnr(sakstittel):
         _legg_til(m.group(1), m.group(2))
         maskert = maskert[: m.start()] + " " * (m.end() - m.start()) + maskert[m.end():]
 
+    m_sak = _TRAILING_SAKSNR_REFERANSE.search(maskert)
+    if m_sak and _er_isolert_sakstallpar(maskert, m_sak):
+        maskert = maskert[: m_sak.start()] + " " * (len(maskert) - m_sak.start())
+
     for m in _GNR_BNR_RE.finditer(maskert):
         gnr, bnr = m.group(1), m.group(2)
-        if any(_GNR_BNR_AARSTALL_MIN <= int(tall) <= _GNR_BNR_AARSTALL_MAKS for tall in (gnr, bnr)):
+        # KUN gnr-tallet sjekkes mot årstall-området, ikke bnr - ekte bnr-tall
+        # er ofte selv i tusen-området (bekreftet f.eks. "138/4792" i modul-
+        # docstringen), så et bnr som TILFELDIGVIS ligner et årstall må ikke
+        # forkastes av den grunn (bekreftet regresjon: en ekte 3-parts gnr/bnr-
+        # liste "07/121, 11/1917 og 19/817" mistet det midterste paret når
+        # bnr=1917 alene ble nok til å avvise det, selv om gnr=11 er en helt
+        # plausibel verdi).
+        if _GNR_BNR_AARSTALL_MIN <= int(gnr) <= _GNR_BNR_AARSTALL_MAKS:
             continue
         foran = maskert[: m.start()]
         ord_m = _ORD_FOR_TALLPAR_RE.search(foran)
-        if ord_m and ord_m.group(1).lower() in _GNR_BNR_BLOKKORD:
+        if ord_m and (
+            ord_m.group(1).lower() in _GNR_BNR_BLOKKORD
+            or _GATE_ENDELSE_RE.search(ord_m.group(1))
+        ):
             continue
         _legg_til(gnr, bnr)
 
