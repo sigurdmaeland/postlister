@@ -57,11 +57,15 @@ Brukes av:
   - running_daily/{bygg,tilsyn,ulov,henv}/app/main.py     (daglig endringslogg)
 """
 
+import gzip
 import json
+import os
 import re
+import tempfile
 import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -78,6 +82,25 @@ DOCUMENT_URL = BASE_URL + "/file/{}"   # nedlastings-URL for dokumenter (kun ikk
 
 KOMMUNE = "Tromsø"
 KOMMUNE_NR = 5501   # gjeldende siden 2024 (var 5401 før)
+
+# Azure Blob - samme lagringskonto/container og samme mønster (Service
+# Principal via env/.env, JSONL+gzip) som Kristiansand-pipelinen i dette
+# repoet, se _azure_credential()/upload_til_azure() nedenfor. Tromsøs
+# run_daily bruker et ekte datovindu (se WINDOW_DAYS/fetch_window) - det
+# finnes derfor ingen snapshot/diff-tilstand å speile i Azure slik
+# Kristiansand gjør (som mangler datofiltrering og må gjøre full sweep +
+# snapshot-diff); kun de to opplastings-hookene under (endringslogg +
+# full-dump) er relevante å portere hit.
+AZURE_ACCOUNT_URL = "https://storaggen2eaccountprod.blob.core.windows.net"
+AZURE_CONTAINER_NAME = "postlister"
+AZURE_BASE_PATH = "bronze/tromso"
+
+_SAKSTYPE_SLUG = {
+    "Byggesak": "bygg",
+    "Henvendelse": "henv",
+    "Ulovlighetssak": "ulov",
+    "Tilsynssak": "tilsyn",
+}
 
 TYPE_IDS = {
     "Byggesak": "1298e845-ec94-43ee-a11a-5606b40a9f71",
@@ -782,6 +805,177 @@ def group_journalposter(all_journals, all_proceedings):
 
 
 # --------------------------------------------------------------------------- #
+# Azure Blob - opplasting av endringslogg + full-dump
+# --------------------------------------------------------------------------- #
+def _azure_credential():
+    """Azure Blob-credential, med tre mulige kilder, forsøkt i denne
+    rekkefølgen (identisk mønster som Kristiansand, se der for utfyllende
+    docstring):
+      1) Databricks secrets (scope "postlister"), hvis kjørt der.
+      2) Service Principal via miljøvariabler - lastes fra bronze/postlister/
+         .env (samme delte hemmeligheter/fil som resten av "postlister"-
+         containeren, IKKE kommune-spesifikk).
+      3) Egen Azure CLI-innlogging (`az login`) via AzureCliCredential.
+    Kaster ValueError/RuntimeError med en tydelig melding hvis ingen av dem
+    virker - upload_til_azure()/upload_full_dump_til_azure() fanger denne og
+    hopper over opplastingen i stedet for å krasje hele den lokale
+    skrape-kjøringen."""
+    try:
+        from pyspark.dbutils import DBUtils
+        from pyspark.sql import SparkSession
+        dbutils = DBUtils(SparkSession.builder.getOrCreate())
+    except Exception:  # noqa: BLE001
+        dbutils = None
+
+    if dbutils is not None:
+        get = lambda k: dbutils.secrets.get(scope="postlister", key=k)  # noqa: E731
+    else:
+        try:
+            from dotenv import load_dotenv
+            # Fila ligger på bronze/postlister/-nivå (delt for alle kommuner) -
+            # let oppover til vi finner mappen som faktisk heter "postlister".
+            for parent in Path(__file__).resolve().parents:
+                if parent.name == "postlister":
+                    load_dotenv(dotenv_path=parent / ".env")
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+        get = lambda k: os.environ.get(k)  # noqa: E731
+
+    client_id = get("SP-PIPELINE-POSTLISTER-CLIENT-ID")
+    tenant_id = get("SP-PIPELINE-POSTLISTER-TENANT-ID")
+    client_secret = get("SP-PIPELINE-POSTLISTER-CLIENT-SECRET")
+
+    if client_id and tenant_id and client_secret:
+        from azure.identity import ClientSecretCredential
+        return ClientSecretCredential(tenant_id=tenant_id, client_id=client_id, client_secret=client_secret)
+
+    # Ingen Service Principal satt opp - fall tilbake til egen az-login.
+    try:
+        from azure.identity import AzureCliCredential
+        credential = AzureCliCredential()
+        credential.get_token("https://storage.azure.com/.default")
+        return credential
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "Mangler Azure-credential: ingen Service Principal satt (sett "
+            "SP-PIPELINE-POSTLISTER-CLIENT-ID/-TENANT-ID/-CLIENT-SECRET i "
+            "bronze/postlister/.env, se .env.example) OG 'az login' via Azure "
+            f"CLI er ikke gjort/fungerer ikke ({e})"
+        ) from e
+
+
+def _last_opp_jsonl_gz(poster, blob_name, credential):
+    """Serialiser en liste med poster til JSONL (én post per linje),
+    gzip-komprimer, og last opp som én blob (overskriver hvis den allerede
+    finnes - trygt å kjøre kjøringen på nytt for samme dato)."""
+    from azure.storage.blob import BlobServiceClient
+
+    jsonl = "\n".join(json.dumps(p, ensure_ascii=False) for p in poster)
+    komprimert = gzip.compress(jsonl.encode("utf-8"))
+
+    client = BlobServiceClient(AZURE_ACCOUNT_URL, credential=credential,
+                                connection_timeout=TIMEOUT, read_timeout=TIMEOUT)
+    blob = client.get_container_client(AZURE_CONTAINER_NAME).get_blob_client(blob_name)
+    blob.upload_blob(komprimert, overwrite=True)
+    return len(komprimert)
+
+
+def _fallback_lagre_midlertidig(poster, filnavn):
+    """Skriver en liste med poster til systemets midlertidige mappe (IKKE i
+    repoet, og IKKE et sted som vokser ubegrenset) - brukes KUN som
+    nødløsning når selve Azure-opplastingen feiler (manglende credentials,
+    nettverksfeil), slik at dagens data ikke går helt tapt. Stien logges
+    tydelig slik at filen kan følges opp/lastes opp på nytt manuelt - i
+    motsetning til de gamle output/-filene blir denne ALDRI en permanent
+    lokal kopi (OS-en rydder egen temp-mappe over tid)."""
+    path = Path(tempfile.gettempdir()) / f"{filnavn}.json"
+    try:
+        path.write_text(json.dumps(poster, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"  [Azure] lagret midlertidig lokalt i stedet (IKKE i repoet): {path}")
+    except Exception as e:  # noqa: BLE001
+        print(f"  [Azure] KLARTE IKKE Å lagre fallback-kopi heller ({e}) - "
+              f"disse {len(poster)} postene er tapt for denne kjøringen")
+
+
+def upload_til_azure(nye_saker, nye_journalposter, ref_date, sakstype):
+    """Laster dagens endringslogg (nye saker + nye journalposter-på-gamle-
+    saker) DIREKTE til Azure Blob som JSONL+gzip - INGEN lokal fil skrives i
+    repoet i det hele tatt (se write_output-docstring). Dette kjører daglig
+    i det uendelige på tvers av fire sakstyper, og ett filpar per dag/
+    sakstype ville vokst ubegrenset på disken over tid - selve poenget med
+    denne funksjonen er å unngå akkurat det.
+
+    Stikonvensjon (identisk med Kristiansand): bronze/tromso/
+    load_type=incremental/date=<ref_date>/<slug>_saker-<ref_date>.jsonl.gz
+    (+ <slug>_journalposter-<ref_date>.jsonl.gz).
+
+    Feiler ALDRI hele kjøringen ved Azure-problemer (manglende credentials,
+    nettverksfeil, osv.) - i stedet havner en midlertidig fallback-kopi
+    UTENFOR repoet (se _fallback_lagre_midlertidig), slik at dagens data
+    ikke går tapt selv om ingenting normalt skrives lokalt."""
+    slug = _SAKSTYPE_SLUG.get(sakstype, sakstype.lower())
+    try:
+        credential = _azure_credential()
+    except Exception as e:  # noqa: BLE001
+        print(f"  [Azure] KUNNE IKKE laste opp - {e}")
+        for filnavn, poster in ((f"{slug}_saker-{ref_date}", nye_saker),
+                                 (f"{slug}_journalposter-{ref_date}", nye_journalposter)):
+            if poster:
+                _fallback_lagre_midlertidig(poster, filnavn)
+        return
+
+    prefix = f"{AZURE_BASE_PATH}/load_type=incremental/date={ref_date}"
+    for filnavn, poster in ((f"{slug}_saker", nye_saker), (f"{slug}_journalposter", nye_journalposter)):
+        if not poster:
+            continue
+        blob_name = f"{prefix}/{filnavn}-{ref_date}.jsonl.gz"
+        try:
+            storrelse = _last_opp_jsonl_gz(poster, blob_name, credential)
+            print(f"  [Azure] lastet opp {len(poster)} poster -> "
+                  f"{AZURE_CONTAINER_NAME}/{blob_name} ({storrelse / 1024:.1f} KB)")
+        except Exception as e:  # noqa: BLE001
+            print(f"  [Azure] opplasting FEILET for {blob_name}: {e}")
+            _fallback_lagre_midlertidig(poster, f"{filnavn}-{ref_date}")
+
+
+def upload_full_dump_til_azure(poster, sakstype):
+    """Laster HELE engangs-historikk-dumpen (all-i-en-fil fra run_full_dump(),
+    som selv etter et delvis `python3 main.py <start> <end>`-kall alltid
+    inneholder den FULLE akkumulerte tilstanden - se load_existing_saker/
+    _merge_journalposter) opp til Azure Blob som JSONL+gzip - én blob for
+    hele sakstypen.
+
+    Stikonvensjon (identisk med Kristiansand): bronze/tromso/load_type=full/
+    <slug>/dump_date=<i_dag>/<slug>_saker-full-<i_dag>.jsonl.gz - partisjonert
+    på KJØREDATO (når dumpen ble tatt), ikke sakens egen dato, siden
+    run_full_dump samler ALT i én fil i stedet for å partisjonere per måned
+    slik Trondheim gjør.
+
+    Feiler ALDRI (samme mønster som upload_til_azure) - den lokale filen fra
+    run_full_dump() er alltid den autoritative kopien uansett."""
+    if not poster:
+        print("  [Azure] ingen poster å laste opp (tom dump)")
+        return
+
+    slug = _SAKSTYPE_SLUG.get(sakstype, sakstype.lower())
+    try:
+        credential = _azure_credential()
+    except Exception as e:  # noqa: BLE001
+        print(f"  [Azure] hopper over full-dump-opplasting - {e}")
+        return
+
+    i_dag = datetime.now(ZoneInfo("Europe/Oslo")).date()
+    blob_name = f"{AZURE_BASE_PATH}/load_type=full/{slug}/dump_date={i_dag}/{slug}_saker-full-{i_dag}.jsonl.gz"
+    try:
+        storrelse = _last_opp_jsonl_gz(poster, blob_name, credential)
+        print(f"  [Azure] lastet opp {len(poster)} poster (full dump) -> "
+              f"{AZURE_CONTAINER_NAME}/{blob_name} ({storrelse / 1024:.1f} KB)")
+    except Exception as e:  # noqa: BLE001
+        print(f"  [Azure] full-dump-opplasting FEILET for {blob_name}: {e}")
+
+
+# --------------------------------------------------------------------------- #
 # Engangs historisk dump (2019-10-22-today_dump) - dag-for-dag, gjenopptakbar
 # --------------------------------------------------------------------------- #
 def run_full_dump(output_file, type_id, sakstype, start=START_DATE, end=None, save_every=30):
@@ -843,6 +1037,8 @@ def run_full_dump(output_file, type_id, sakstype, start=START_DATE, end=None, sa
         print(f"OBS: {len(ukjent_sak)} journalposter hørte til saker utenfor "
               f"{start}..{end} og ble ikke tatt med (utenfor dumpens periode).")
 
+    upload_full_dump_til_azure(list(saker_by_id.values()), sakstype)
+
 
 # --------------------------------------------------------------------------- #
 # Daglig endringslogg (running_daily) - datovindu (ekte datoer, ingen snapshot)
@@ -850,17 +1046,18 @@ def run_full_dump(output_file, type_id, sakstype, start=START_DATE, end=None, sa
 WINDOW_DAYS = 1   # dager bakover fra referansedatoen (1 = kun referansedagen)
 
 
-def write_output(nye_saker, nye_journalposter, ref_date, output_dir):
-    output_dir.mkdir(exist_ok=True)
-    (output_dir / f"saker_{ref_date}.json").write_text(
-        json.dumps(nye_saker, ensure_ascii=False, indent=2), encoding="utf-8")
-    (output_dir / f"journalposter_{ref_date}.json").write_text(
-        json.dumps(nye_journalposter, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Skrev {len(nye_saker)} nye saker og "
-          f"{len(nye_journalposter)} saker med nye journalposter -> {output_dir}")
+def write_output(nye_saker, nye_journalposter, ref_date, sakstype):
+    """Laster dagens endringslogg til Azure - se upload_til_azure(). Skriver
+    BEVISST ingen lokal fil i repoet: dette kjører daglig i det uendelige på
+    tvers av fire sakstyper, og en varig lokal kopi per dag ville vokst
+    ubegrenset på disken over tid. Ved en mislykket Azure-opplasting havner
+    en fallback-kopi i systemets midlertidige mappe i stedet (se
+    _fallback_lagre_midlertidig), aldri i repoet."""
+    print(f"{len(nye_saker)} nye saker, {len(nye_journalposter)} saker med nye journalposter i dag")
+    upload_til_azure(nye_saker, nye_journalposter, ref_date, sakstype)
 
 
-def run_daily(output_dir, type_id, sakstype, day_back=1, window_days=WINDOW_DAYS):
+def run_daily(type_id, sakstype, day_back=1, window_days=WINDOW_DAYS):
     """Daglig endringslogg - datobasert (ekte 'date'/'journalDate'-felt).
     'proceeding.date' ser ut til å være siste aktivitetsdato, ikke
     opprettelsesdato, så en sak som får en ny journalpost i dag dukker
@@ -898,4 +1095,4 @@ def run_daily(output_dir, type_id, sakstype, day_back=1, window_days=WINDOW_DAYS
             "nye_journalposter": [build_journalpost(j) for j in docs],
         })
 
-    write_output(nye_saker, nye_journalposter, to_iso, output_dir)
+    write_output(nye_saker, nye_journalposter, to_iso, sakstype)
