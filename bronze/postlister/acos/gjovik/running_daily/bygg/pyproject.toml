@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "postlister-gjovik-bygg"
+version = "0.1.0"
+description = "Bronze layer for Gjøvik byggesaker (running_daily) - daglig endringslogg mot ACOS nye-innsyn"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "azure-storage-blob>=12.19.0",
+    "azure-identity>=1.15.0",
+    "python-dotenv>=1.0.0"
+]
+
+[project.scripts]
+gjovik-bygg-trigger = "app.main:trigger"

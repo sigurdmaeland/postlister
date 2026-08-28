@@ -1,0 +1,7 @@
+{
+  "DATABRICKS_HOST": "https://<workspace>.cloud.databricks.com",
+  "DATABRICKS_TOKEN": "<personal-access-token>",
+  "DATABRICKS_CLIENT_ID": "",
+  "DATABRICKS_CLIENT_SECRET": "",
+  "DATABRICKS_CLUSTER_ID": "<cluster-id>"
+}

@@ -19,6 +19,7 @@ ENV/
 .env.*
 !.env.example
 *.pem
+**/connection.json
 
 # --- Operativsystem ---
 .DS_Store
@@ -40,3 +41,4 @@ desktop.ini
 **/running_daily/**/run.log
 **/running_daily/**/seen_journalpost_ids.json
 **/running_daily/**/snapshot.json
+**/running_daily/**/snapshot_*.json

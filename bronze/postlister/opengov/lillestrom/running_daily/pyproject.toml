@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "postlister-lillestrom-bronze"
+version = "0.1.0"
+description = "Bronze layer for Lillestrøm postliste (running_daily) - alle fire sakstyper (bygg/henv/ulov/tilsyn) i én wheel, siden de deler 100% identisk skrapelogikk på samme OpenGov-portal og kun skiller seg på søkeprefiks"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "azure-storage-blob>=12.19.0",
+    "azure-identity>=1.15.0",
+    "python-dotenv>=1.0.0"
+]
+
+[project.scripts]
+lillestrom-bygg-trigger = "app.main:trigger_bygg"
+lillestrom-henv-trigger = "app.main:trigger_henv"
+lillestrom-ulov-trigger = "app.main:trigger_ulov"
+lillestrom-tilsyn-trigger = "app.main:trigger_tilsyn"
