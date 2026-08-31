@@ -103,6 +103,12 @@ def _get_spark():
     cluster_id = (config.get("DATABRICKS_CLUSTER_ID") or "").strip()
     if cluster_id:
         os.environ["DATABRICKS_CLUSTER_ID"] = cluster_id
+    else:
+        # Ingen cluster ID satt => bruk serverless compute. Uten dette vet
+        # ikke Databricks Connect hvilken compute den skal koble til, og
+        # getOrCreate() feiler/henger på et serverless-only workspace.
+        os.environ["DATABRICKS_SERVERLESS_COMPUTE_ID"] = "auto"
+        print("Ingen DATABRICKS_CLUSTER_ID satt - bruker serverless compute.", file=sys.stderr)
 
     if config.get("DATABRICKS_TOKEN"):
         os.environ["DATABRICKS_TOKEN"] = config["DATABRICKS_TOKEN"].strip()
