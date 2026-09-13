@@ -42,3 +42,6 @@ desktop.ini
 **/running_daily/**/seen_journalpost_ids.json
 **/running_daily/**/snapshot.json
 **/running_daily/**/snapshot_*.json
+
+# --- Stats: maskinlesbart cache-output fra dump_stats.py (regenereres ved --scan) ---
+scripts/dump_stats.json
