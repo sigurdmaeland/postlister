@@ -28,22 +28,19 @@ KOMMUNE_NR = 3205   # Lillestrøm (endret fra 3030 ved kommunenummer-endringen i
 KOMMUNE = "Lillestrøm"
 
 # Azure Blob - samme konto/container/opplastingsmønster som de andre
-# kommunene, se _azure_credential()/upload_til_azure() lenger ned.
-#
-# Portalen her har verken dato-filter eller API/feed, så run_daily() må
-# gjøre en full sveip av alle sakene hver dag og diffe mot forrige
-# snapshot. Snapshotet ligger derfor i Azure, ikke bare lokalt, slik at en
-# ny Databricks-kjøring uten lokal disk fra i går fortsatt finner riktig
-# utgangspunkt.
-#
-# Den daglige endringsloggen skriver ikke noen lokal fil i repoet (se
-# write_changelog) - jobben kjører evig hver dag på tvers av fire
+# kommunene, se _azure_credential()/upload_til_azure() lenger ned. Portalen
+# her har verken dato-filter eller API/feed, så run_daily() må gjøre en full
+# sveip av alle sakene hver dag og diffe mot forrige snapshot - det
+# snapshotet ligger derfor i Azure, ikke bare lokalt, slik at en ny
+# Databricks-kjøring uten lokal disk fra i går fortsatt finner riktig
+# utgangspunkt. Den daglige endringsloggen skriver ikke noen lokal fil i
+# repoet (se write_changelog) - den kjører evig hver dag på tvers av fire
 # sakstyper, og en fil per dag ville bare vokst og vokst.
 AZURE_ACCOUNT_URL = "https://storaggen2eaccountprod.blob.core.windows.net"
 AZURE_CONTAINER_NAME = "postlister"
 AZURE_BASE_PATH = "bronze/lillestrom"
 
-MAX_WORKERS = 8
+MAX_WORKERS = 8       # antall parallelle forespørsler
 TIMEOUT = 30
 RETRIES = 3
 
@@ -532,7 +529,7 @@ def parse_case(html, document_id):
             t = li.get_text(strip=True)
             if not t:
                 continue
-            t = LOPENUMMER_RE.sub("", t)
+            t = LOPENUMMER_RE.sub("", t)             # fjern løpenummeret foran
             m = GNR_BNR_RE.search(t)
             if m:
                 gnr_bnr.append(m.group(1))
@@ -653,7 +650,7 @@ def fetch_case(session, document_id):
             return parse_case(r.text, document_id)
         except Exception as e:  # noqa: BLE001
             last_err = e
-            time.sleep(1.5 * (attempt + 1))
+            time.sleep(1.5 * (attempt + 1))   # vent lenger for hvert nye forsøk
     # Alle forsøk feilet - returner saken med feilmelding i stedet for å stoppe kjøringen
     return {"document_id": str(document_id), "url": url, "error": str(last_err)}
 
@@ -696,7 +693,7 @@ def _atomic_write_json(data, path, **dump_kwargs):
     tmp = path.with_suffix(".json.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, **dump_kwargs)
-    tmp.replace(path)
+    tmp.replace(path)   # bytt inn den ferdige fila i ett steg
 
 
 def _hent_saksliste(saksnummer_prefiks, limit=None):
@@ -738,11 +735,11 @@ def run_full_dump(output_file, saksnummer_prefiks, limit=None, save_every=200):
     done = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {ex.submit(fetch_case, session, i): i for i in todo}
-        for fut in as_completed(futures):
+        for fut in as_completed(futures):   # ta imot resultatene etter hvert som de blir ferdige
             res = fut.result()
             results[res["document_id"]] = res
             done += 1
-            if done % save_every == 0:
+            if done % save_every == 0:   # lagre fremdriften jevnlig underveis
                 save_resultater(results, output_file)
                 print(f"  {done}/{len(todo)} hentet (lagret)")
 

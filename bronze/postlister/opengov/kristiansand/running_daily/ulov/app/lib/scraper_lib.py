@@ -122,7 +122,10 @@ def _parse_address_parts(s):
             continue
         sm = _STREET_AND_NUMBER_RANGE.match(part)
         if sm and (sep is None or _STARTS_UPPER.match(sm.group(1).strip())):
-            current_street = sm.group(1).strip()
+            gatenavn = sm.group(1).strip()
+            if _FELTKODE_I_GATENAVN.search(gatenavn):
+                break
+            current_street = gatenavn
             norm = re.sub(r"\s*-\s*", "-", sm.group(2))
             entries.append(f"{current_street} {norm}")
             mnum = re.match(r"^(\d+)", norm)
@@ -137,6 +140,15 @@ def _parse_address_parts(s):
             seen.add(e)
             uniq.append(e)
     return uniq
+
+
+def _gatenavn(adresse):
+    """Gatenavnet (uten husnummer) fra en ferdig adressestreng, f.eks.
+    "Vardåsveien 96" -> "Vardåsveien" - brukt til å avgjøre om en tittel-
+    gjettet adresse gjelder SAMME gate som panelet allerede har bekreftet
+    (se parse_case)."""
+    m = _STREET_AND_NUMBER_RANGE.match(adresse)
+    return m.group(1).strip() if m else None
 
 
 def clean_adresser(raw_list):
@@ -210,6 +222,16 @@ def build_matrikkelnr(gnr_bnr_list, kommune_nr, tittel=None):
             parts.append(f"{kommune_nr}-{g}")
     return "; ".join(parts)
 
+
+# Et "felt-/sonekode"-ord (bokstav+1-2 tall, f.eks. "B3", "K2", "F1") midt i
+# en adressekandidat er et pålitelig tegn på at HELE kandidaten er en
+# område-/planreferanse ("Eidet felt B3, Eidsdalen 11-41") og ikke en ekte
+# gateadresse - ekte gatenavn i kilden inneholder ALDRI et slikt fritt-
+# stående tegn (bekreftet: kun 1 forekomst i hele stikkprøven på ~2000
+# saker, og den var nettopp en slik feilaktig lest sone-/planreferanse -
+# se rapport). Kun ordet FORAN selve husnummeret sjekkes (bokstav-suffiks
+# på husnummeret selv, f.eks. "16B", er noe helt annet og skal IKKE avvises).
+_FELTKODE_I_GATENAVN = re.compile(r"\b[A-Za-zæøåÆØÅ]\d{1,2}\b")
 
 _HAR_HUSNUMMER = re.compile(r"\s\d+[A-Za-zæøåÆØÅ]?(-\w+)?$")
 # " - GNR/BNR - melding om mulig ulovlig tiltak - ..." - eldre/uformelt
@@ -300,7 +322,8 @@ def address_from_tittel(tittel, kommune_nr):
     if addr_candidate and not ingen_adresse:
         normalized = _normalize_nummer_bokstav(addr_candidate)
         entries = _parse_address_parts(normalized)
-        if not entries and _har_husnummer(normalized):
+        if (not entries and _har_husnummer(normalized)
+                and not _FELTKODE_I_GATENAVN.search(normalized)):
             entries = [normalized]   # kandidaten splittes ikke, men er selv gyldig
         if entries:
             adresse_liste = entries
@@ -312,33 +335,112 @@ _GNR_BNR_PAIR = re.compile(r"(\d+)/(\d+)(?:/\d+){0,2}")
 _MATRIKKEL_SEP = re.compile(r"\s*(?:,|\bog\b)\s*")
 
 
+_BARE_BNR = re.compile(r"\d+")
+
+
 def extra_gnr_bnr_fra_tittel(tittel):
     """Finn EKSTRA gnr/bnr-par oppgitt sammen med det første i en "og"/","-
     atskilt matrikkelliste i sakstittelen, f.eks. "244/30/0/0 og 244/70,
     Ingen adresse, ..." eller "10/52/0/0 og 10/53 Branderudveien 2, ...".
-    Disse sakene gjelder flere eiendommer samtidig - det andre (og evt.
-    tredje osv.) paret finnes ALLTID i TILLEGG til det adresse-panelet
-    allerede måtte ha gitt (som typisk kun viser det første), derfor kalles
-    denne alltid fra parse_case, uavhengig av om adresse/gnr_bnr allerede
-    er fylt ut fra andre kilder. Stopper ved første ledd som ikke selv er
-    et nytt matrikkelnummer, for å unngå å plukke opp uskyldige tall lenger
-    ute i beskrivelsesteksten."""
+    Listen kan også bestå av BARE bruksnummer (samme gårdsnummer for alle),
+    f.eks. "Okse - 426/55, 50, 47, 71, 54 - melding om ..." -> 426/50,
+    426/47, 426/71, 426/54 (bekreftet på ekte data - se rapport). Disse
+    sakene gjelder flere eiendommer samtidig - det andre (og evt. tredje
+    osv.) paret finnes ALLTID i TILLEGG til det adresse-panelet allerede
+    måtte ha gitt (som typisk kun viser det første), derfor kalles denne
+    alltid fra parse_case, uavhengig av om adresse/gnr_bnr allerede er fylt
+    ut fra andre kilder. Stopper ved første ledd som ikke selv er et nytt
+    matrikkelnummer (fullt par ELLER bart bruksnummer), for å unngå å
+    plukke opp uskyldige tall lenger ute i beskrivelsesteksten."""
     if not tittel:
         return []
     m = _GNR_BNR_TITLE.search(tittel)
     if not m:
         return []
     pairs = []
+    gnr = m.group(1)
     pos = m.end()
     while True:
         sep = _MATRIKKEL_SEP.match(tittel, pos)
         if not sep:
             break
         pm = _GNR_BNR_PAIR.match(tittel, sep.end())
-        if not pm:
-            break
-        pairs.append(f"{pm.group(1)}/{pm.group(2)}")
-        pos = pm.end()
+        if pm:
+            gnr = pm.group(1)
+            pairs.append(f"{pm.group(1)}/{pm.group(2)}")
+            pos = pm.end()
+            continue
+        bm = _BARE_BNR.match(tittel, sep.end())
+        if bm:
+            pairs.append(f"{gnr}/{bm.group(0)}")
+            pos = bm.end()
+            continue
+        break
+    return pairs
+
+
+# Et saksreferansenummer skrevet direkte inntil en sakstype-forkortelse
+# ("BYGG-26/02377", "TILSYN-24/01394", "BYGG--25/02209" - dobbel bindestrek
+# er en kilde-skrivefeil, ikke uvanlig) ser strukturelt ut som et gnr/bnr,
+# men er det ALDRI - forkortelsen er kildens EGET saksnummerformat (se
+# SAKSTYPE_FRA_PREFIKS). Kjennetegn: 2+ store bokstaver rett foran (uten
+# mellomrom), evt. med bindestrek(er) mellom - ekte gatenavn/beskrivelser
+# har aldri dette rett før et tall (bekreftet ved stikkprøve mot ~2000
+# saker - eneste treff var nettopp slike saksreferanser, se rapport).
+_SAKSREF_PREFIX = re.compile(r"[A-ZÆØÅ]{2,}-+$")
+# Samme type saksreferanse, men skrevet med vanlig ord + mellomrom i stedet
+# for forkortelse+bindestrek, f.eks. "tidligere sak 2015/1002", "se sak
+# 26/16416", "tidligere byggesak 2010/0779" - "år/løpenummer"-formatet er
+# identisk med et ekte gnr/bnr, men ordet rett foran ("sak"/"saksnummer"/
+# "byggesak") er et pålitelig tegn på at det ikke er det (bekreftet ved
+# stikkprøve mot ekte data - se rapport).
+_SAKSREF_ORD = re.compile(r"\b(?:sak|saksnummer|byggesak)\s*$", re.IGNORECASE)
+# Hele tallkjeden fanges (ikke bare de to første) fordi et fåtall titler
+# skriver kommunenummeret FØRST i kjeden ("4204/13/143" = KOMMUNE_NR/gnr/bnr,
+# ikke gnr/bnr 4204/13 - bekreftet på ekte data, se
+# _gnr_bnr_fra_tallkjede_krs), samme mønster som Trondheim/Tromsø/Drammen.
+_TALLKJEDE = re.compile(r"\d+(?:/\d+){1,3}")
+
+
+def _gnr_bnr_fra_tallkjede_krs(tallkjede):
+    """Tolk en tallkjede "A/B[/C[/D]]" som gnr/bnr - hopper over en ledende
+    KOMMUNE_NR hvis kjeden starter med den. Returnerer None hvis kjeden ETTER
+    et slikt KOMMUNE_NR-hopp ikke har et fullt gnr/bnr-par igjen (f.eks.
+    "4204/472" - kun kommunenr+gnr, ingen bnr - en ufullstendig/redundant
+    delvis gjentakelse, ikke en ekte matrikkel i seg selv)."""
+    nums = tallkjede.split("/")
+    if nums[0] == str(KOMMUNE_NR):
+        if len(nums) < 3:
+            return None
+        return nums[1], nums[2]
+    return nums[0], nums[1]
+
+
+def ekstra_matrikkel_annet_sted_i_tittel(tittel):
+    """Finn et HELT SEPARAT matrikkelnummer nevnt et annet sted i tittelen -
+    ikke rett etter det første (se extra_gnr_bnr_fra_tittel for den listen),
+    men et fritt-stående gnr/bnr lenger ute i teksten, f.eks. "Borøya -
+    425/2 - Strand innerst i Vesterviga 52/2/0/0, inngrep i strandsonen"
+    (425/2 OG 52/2 - to ulike matrikler i samme sak, ikke en liste).
+    Ekskluderer saksreferansenumre (se _SAKSREF_PREFIX) og "0/0"-
+    plassholderen. Rent tillegg - kalles alltid fra parse_case sammen med
+    extra_gnr_bnr_fra_tittel, uavhengig av hva andre kilder ga."""
+    if not tittel:
+        return []
+    pairs = []
+    for m in _TALLKJEDE.finditer(tittel):
+        foran = tittel[:m.start()]
+        if _SAKSREF_PREFIX.search(foran) or _SAKSREF_ORD.search(foran):
+            continue
+        tolket = _gnr_bnr_fra_tallkjede_krs(m.group(0))
+        if not tolket:
+            continue
+        gnr, bnr = tolket
+        if gnr == "0" and bnr == "0":
+            continue
+        pair = f"{gnr}/{bnr}"
+        if pair not in pairs:
+            pairs.append(pair)
     return pairs
 
 
@@ -526,21 +628,36 @@ def parse_case(html, document_id):
     adresse_clean = clean_adresser(adresse)
     gnr_bnr_clean = clean_gnr_bnr(gnr_bnr)
 
-    # Fallback: hent adresse/gnr_bnr fra sakstittelen når adresse-panelet på
-    # siden ikke ga noe (typisk for useriøst rapporterte ulovlighetssaker) -
-    # fyller kun inn hull, overstyrer aldri det panelet faktisk ga.
-    if not adresse_clean or not gnr_bnr_clean:
-        fallback_adresse, fallback_gnr_bnr = address_from_tittel(sakstittel, KOMMUNE_NR)
-        if not adresse_clean and fallback_adresse:
-            adresse_clean = list(fallback_adresse)
-        if not gnr_bnr_clean and fallback_gnr_bnr:
-            gnr_bnr_clean = [fallback_gnr_bnr]
+    # Hentes alltid (ikke bare når panelet er tomt) - brukes både som
+    # fallback (panelet helt tomt) og som TILLEGG (panelet delvis tomt,
+    # se under), aldri som overstyring av det panelet faktisk ga.
+    fallback_adresse, fallback_gnr_bnr = address_from_tittel(sakstittel, KOMMUNE_NR)
 
-    # Saken kan gjelde FLERE eiendommer samtidig ("244/30/0/0 og 244/70,
-    # ...") - fanger opp ekstra gnr/bnr-par fra en slik liste i tittelen,
-    # uansett hvor adresse/gnr_bnr for øvrig kom fra (rent tillegg, aldri
-    # en overstyring).
-    for ekstra in extra_gnr_bnr_fra_tittel(sakstittel):
+    if not adresse_clean and fallback_adresse:
+        adresse_clean = list(fallback_adresse)
+    elif adresse_clean and fallback_adresse:
+        # Tittelen kan liste FLERE husnumre for samme gate enn det
+        # adresse-panelet faktisk viser ("Vardåsveien 94 og 96 58/124/0/0,
+        # ..." -> panelet ga kun "Vardåsveien 94") - berik additivt, men
+        # bare for gater panelet allerede har bekreftet, slik at en urelatert
+        # tittel-gjetning ikke blandes inn når panelet har full/korrekt data
+        # for en annen gate (bekreftet på ekte data - se rapport).
+        kjente_gater = {g for g in (_gatenavn(a) for a in adresse_clean) if g}
+        for cand in fallback_adresse:
+            if cand not in adresse_clean and _gatenavn(cand) in kjente_gater:
+                adresse_clean.append(cand)
+
+    if not gnr_bnr_clean and fallback_gnr_bnr:
+        gnr_bnr_clean = [fallback_gnr_bnr]
+
+    # Saken kan gjelde FLERE eiendommer samtidig - enten som en liste rett
+    # etter det første matrikkelnummeret ("244/30/0/0 og 244/70, ..." eller
+    # "426/55, 50, 47, 71, 54 - ...", se extra_gnr_bnr_fra_tittel), eller som
+    # et helt separat matrikkelnummer et annet sted i tittelen ("Borøya -
+    # 425/2 - Strand innerst i Vesterviga 52/2/0/0, ...", se
+    # ekstra_matrikkel_annet_sted_i_tittel). Fanger opp begge, uansett hvor
+    # adresse/gnr_bnr for øvrig kom fra (rent tillegg, aldri en overstyring).
+    for ekstra in extra_gnr_bnr_fra_tittel(sakstittel) + ekstra_matrikkel_annet_sted_i_tittel(sakstittel):
         if ekstra not in gnr_bnr_clean:
             gnr_bnr_clean.append(ekstra)
 
@@ -668,8 +785,12 @@ def run_full_dump(output_file, saksnummer_prefiks, limit=None, save_every=200):
     errors = sum(1 for r in results.values() if "error" in r)
     print(f"Ferdig: {len(results)} saker skrevet til {output_file} ({errors} feilet)")
 
-    if limit is None:   # ikke last opp delkjøringer/lokal test til Azure
-        upload_full_dump_til_azure(list(results.values()), saksnummer_prefiks)
+    # Azure-opplasting er BEVISST frakoblet her - kjør run_full_dump() rent
+    # lokalt (ingen forsøk på tilkobling). Funksjonen upload_full_dump_til_azure()
+    # står fortsatt klar og er uendret - kall den manuelt når Azure-tilgang er
+    # på plass.
+    # if limit is None:   # ikke last opp delkjøringer/lokal test til Azure
+    #     upload_full_dump_til_azure(list(results.values()), saksnummer_prefiks)
 
 
 # --------------------------------------------------------------------------- #

@@ -47,6 +47,13 @@ RETRIES = 3
 GNR_BNR_RE = re.compile(r"\b(\d+/\d+)")   # gårds- og bruksnummer i en adresse
 ADDR_INDEX_RE = re.compile(r"^\d+\.\s*")  # løpenummer foran en adresselinje
 
+# Tilsynssaker skriver ofte gnr/bnr i ren tekst FØRST i selve sakstittelen,
+# f.eks. "Gnr 65 bnr 81 - Tilsyn - Utvidelse av massefylling...", uten at
+# adressepanelet eller andre-linja gir noe (bekreftet på ekte Tilsyn-data der
+# gnr_bnr forble null selv med adresse utfylt). Brukes KUN som siste fallback
+# i parse_case() - overstyrer aldri panelet eller andre_linje.
+_GNR_BNR_TEKST_RE = re.compile(r"\bgnr\.?\s+(\d+)\s*,?\s*bnr\.?\s+(\d+)\b", re.IGNORECASE)
+
 
 # --------------------------------------------------------------------------- #
 # Opprydding av adresse/gnr_bnr + matrikkelnr
@@ -437,6 +444,13 @@ def parse_case(html, document_id):
         if not gnr_bnr_clean and fallback_gnr_bnr:
             gnr_bnr_clean = [fallback_gnr_bnr]
 
+    # Siste fallback: gnr/bnr skrevet i ren tekst i selve sakstittelen (typisk
+    # Tilsynssaker) - se _GNR_BNR_TEKST_RE.
+    if not gnr_bnr_clean:
+        m = _GNR_BNR_TEKST_RE.search(sakstittel)
+        if m:
+            gnr_bnr_clean = [f"{m.group(1)}/{m.group(2)}"]
+
     return {
         "document_id": str(document_id),
         "kommune": KOMMUNE,
@@ -569,8 +583,12 @@ def run_full_dump(output_file, saksnummer_prefiks, limit=None, save_every=200):
     errors = sum(1 for r in results.values() if "error" in r)
     print(f"Ferdig: {len(results)} saker skrevet til {output_file} ({errors} feilet)")
 
-    if limit is None:   # ikke last opp delkjøringer/lokal test til Azure
-        upload_full_dump_til_azure(list(results.values()), saksnummer_prefiks)
+    # Azure-opplasting er BEVISST frakoblet her - kjør run_full_dump() rent
+    # lokalt (ingen forsøk på tilkobling). Funksjonen upload_full_dump_til_azure()
+    # står fortsatt klar og er uendret - kall den manuelt når Azure-tilgang er
+    # på plass.
+    # if limit is None:   # ikke last opp delkjøringer/lokal test til Azure
+    #     upload_full_dump_til_azure(list(results.values()), saksnummer_prefiks)
 
 
 # --------------------------------------------------------------------------- #

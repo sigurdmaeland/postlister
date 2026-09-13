@@ -378,6 +378,27 @@ TOKEN = r"\d+[A-Za-zæøåÆØÅ]?(?:\s*-\s*(?:\d+[A-Za-zæøåÆØÅ]?|[A-Za-z�
 _BARE_TOKEN_FULL = re.compile(rf"^{TOKEN}$")
 _BARE_LETTER_TOKEN = re.compile(r"^[A-Za-zæøåÆØÅ]$")
 _STREET_AND_NUMBER_RANGE = re.compile(rf"^(.+?)\s+({TOKEN})$")
+# "Gatenavn N1/N2[/N3...]" - flere husnummer på samme gate skilt med
+# skråstrek i stedet for bindestrek/komma ("Bankgata 9/11", "Storgata
+# 104/106", "Hjalmar Johansens gate 314/316") - IKKE samme token som brukes
+# i _BARE_TOKEN_FULL/TOKEN over (holdt bevisst separat: hvis skråstrek ble
+# tillatt der òg ville en etterfølgende komma-adskilt bar matrikkel-referanse,
+# f.eks. "..., 18/700, ..." etter en allerede satt gatenavn, feilaktig blitt
+# lest som en fortsettelse av samme gate). Disse behandles IKKE som ett
+# husnummerspenn (i motsetning til bindestrek-varianten over), men som FLERE
+# separate adresser - bekreftet ønsket av bruker for "Bankgata 9/11" ->
+# "Bankgata 9; Bankgata 11".
+_TOKEN_SLASH = r"\d+[A-Za-zæøåÆØÅ]?(?:\s*/\s*\d+[A-Za-zæøåÆØÅ]?)+"
+_STREET_AND_NUMBER_SLASH = re.compile(rf"^(.+?)\s+({_TOKEN_SLASH})$")
+# Ord som strukturelt kan stå rett foran et skråstrek-tallpar men som
+# signaliserer at tallparet er en gnr/bnr- eller saksnummer-referanse, IKKE
+# et gatenavn med to husnummer - "Eiendom(men) 79/115", "på eiendom 115/55",
+# "se sak 22/00672". Bekreftet på ekte data: ekte gatenavn i arkivet er ALDRI
+# et av disse ordene (de er journal-/matrikkel-sjargong, ikke stedsnavn).
+_NON_ADDRESS_LABEL_WORDS = {
+    "eiendom", "eiendommen", "gnr", "bnr", "gbnr", "matrikkel", "matrikkelnr",
+    "byggesak", "sak", "saksnr", "saksnummer",
+}
 _PART_SPLIT = re.compile(r"\s*(,|\bog\b)\s*")
 _STARTS_UPPER = re.compile(r"^[A-ZÆØÅ]")
 # Beskrivelsestekst starter noen ganger med stor bokstav også (norsk
@@ -391,6 +412,18 @@ _STARTS_UPPER = re.compile(r"^[A-ZÆØÅ]")
 _DESCRIPTIVE_MIDTORD = re.compile(
     r"\b(?:av|om|for|til|med|på|vedrørende|angående|nummer)\b", re.IGNORECASE
 )
+# En "gatenavn"-kandidat i en komma-/og-fortsettelse som selv inneholder et
+# LØSRIVET tallord ("Løfteinnretning NINR 1 1902") er ikke et ekte stedsnavn,
+# men en beskrivelse med et internt referansenummer (NINR = identifikasjons-
+# nummer for løfteinnretning i tilsynssaker) som tilfeldigvis ender på nok et
+# tall og ellers matcher _STREET_AND_NUMBER_RANGE/_STREET_AND_NUMBER_SLASH +
+# _STARTS_UPPER uten noe _DESCRIPTIVE_MIDTORD-preposisjon å fange det på.
+# Ekte gatenavn har aldri et løsrevet tallord midt i seg. Bekreftet trygt ved
+# full korpus-sammenligning (fikser 2 allerede lagrede feil av nøyaktig
+# samme mønster - "Grønnegata 80; Løfteinnretning NINR 1 1902 05119" ->
+# "Grønnegata 80" - uten å endre noen andre av de 182 ekte multi-adresse-
+# tilfellene).
+_BARE_DIGIT_WORD = re.compile(r"(?<!\S)\d+(?!\S)")
 
 
 def _normalize_nummer_bokstav(s):
@@ -425,7 +458,22 @@ def _truncate_at_separator_dash(seg):
     return left.strip()
 
 
-def _parse_address_parts(s):
+def _leading_matrikkel_numbers(tittel):
+    """Alle tallene i et evt. ledende matrikkelnr-prefiks (se
+    _LEADING_MATRIKKEL) - brukt av _parse_address_parts til å gjenkjenne når
+    et skråstrek-tallpar lenger ut i tittelen bare RESTATER samme gnr/bnr som
+    prefikset (ikke nye husnummer), f.eks. "96/24/0/0 Vengsøya 96/24" eller
+    "17/1687/0/0 Isbjørnvegen 32. 17/1687" - se bruken i
+    _STREET_AND_NUMBER_SLASH-grenen."""
+    if not tittel:
+        return frozenset()
+    m = _LEADING_MATRIKKEL.match(tittel.strip())
+    if not m:
+        return frozenset()
+    return frozenset(re.findall(r"\d+", m.group(0)))
+
+
+def _parse_address_parts(s, leading_nums=frozenset()):
     entries = []
     current_street = None
     last_number = None
@@ -452,7 +500,8 @@ def _parse_address_parts(s):
             continue
         sm = _STREET_AND_NUMBER_RANGE.match(part)
         if sm and (sep is None or (_STARTS_UPPER.match(sm.group(1).strip())
-                                    and not _DESCRIPTIVE_MIDTORD.search(sm.group(1)))):
+                                    and not _DESCRIPTIVE_MIDTORD.search(sm.group(1))
+                                    and not _BARE_DIGIT_WORD.search(sm.group(1)))):
             current_street = sm.group(1).strip()
             norm = re.sub(r"\s*-\s*", "-", sm.group(2))
             entries.append(f"{current_street} {norm}")
@@ -460,6 +509,26 @@ def _parse_address_parts(s):
             if mnum:
                 last_number = mnum.group(1)
             continue
+        sm_slash = _STREET_AND_NUMBER_SLASH.match(part)
+        if sm_slash and (sep is None or (_STARTS_UPPER.match(sm_slash.group(1).strip())
+                                          and not _DESCRIPTIVE_MIDTORD.search(sm_slash.group(1))
+                                          and not _BARE_DIGIT_WORD.search(sm_slash.group(1)))):
+            street_candidate = sm_slash.group(1).strip()
+            nums = [n.strip() for n in sm_slash.group(2).split("/")]
+            last_word = re.sub(r"\W+$", "", street_candidate).rsplit(" ", 1)[-1].lower()
+            # Avvis restatert gnr/bnr (tallparet finnes allerede i det
+            # ledende matrikkelnr-prefikset), etikett+tallreferanse
+            # ("eiendom"/"sak"/... - se _NON_ADDRESS_LABEL_WORDS), og "0" som
+            # husnummer (kildens placeholder, forekommer aldri i en ekte
+            # adresse - samme prinsipp som gnr "0" i _TITLE_GNR_BNR).
+            restatement = bool(leading_nums) and set(nums) <= leading_nums
+            if ("0" not in nums and last_word not in _NON_ADDRESS_LABEL_WORDS
+                    and not restatement):
+                current_street = street_candidate
+                for n in nums:
+                    entries.append(f"{current_street} {n}")
+                last_number = nums[-1]
+                continue
         break
     seen = set()
     uniq = []
@@ -516,7 +585,7 @@ def extract_adresse(tittel):
 
     tail = ",".join(segs[head_idx + 1:])
     full_candidate = _normalize_nummer_bokstav(head + ("," + tail if tail else ""))
-    entries = _parse_address_parts(full_candidate)
+    entries = _parse_address_parts(full_candidate, leading_nums=_leading_matrikkel_numbers(tittel))
     if not entries:
         return None
     return "; ".join(entries)
@@ -1037,7 +1106,11 @@ def run_full_dump(output_file, type_id, sakstype, start=START_DATE, end=None, sa
         print(f"OBS: {len(ukjent_sak)} journalposter hørte til saker utenfor "
               f"{start}..{end} og ble ikke tatt med (utenfor dumpens periode).")
 
-    upload_full_dump_til_azure(list(saker_by_id.values()), sakstype)
+    # Azure-opplasting er BEVISST frakoblet her - kjør run_full_dump() rent
+    # lokalt (ingen forsøk på tilkobling). Funksjonen upload_full_dump_til_azure()
+    # står fortsatt klar og er uendret - kall den manuelt når Azure-tilgang er
+    # på plass, se retry_azure_upload.py i dump-mappa for mønsteret.
+    # upload_full_dump_til_azure(list(saker_by_id.values()), sakstype)
 
 
 # --------------------------------------------------------------------------- #

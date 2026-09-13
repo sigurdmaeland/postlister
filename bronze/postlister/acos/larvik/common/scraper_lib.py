@@ -647,6 +647,25 @@ def fetch_case(session, kilde_key, identifier, hent_filer=None):
 # sin egen ferske make_session() (session_per_task) i stedet for å dele én
 # sesjon på tvers av alle tråder.
 # --------------------------------------------------------------------------- #
+def _fetch_case_new_session(kilde_key, identifier, hent_filer=None):
+    """Wrapper brukt av run_full_dump/run_daily sin ThreadPoolExecutor:
+    oppretter den ferske per-oppgave-sesjonen (se make_session) INNI selve
+    arbeidertråden, i stedet for at hovedtråden kaller make_session() for
+    hver eneste oppgave FØR den sendes til poolen. Sistnevnte var den reelle
+    årsaken til at run_full_dump kunne fremstå ekstremt treg: make_session()
+    gjør et ekte, blokkerende HTTP-kall (GET mot søkesiden, for å sette
+    anti-forgery-cookien), og en dict/list-comprehension som kaller
+    `make_session()` for hvert element FØR `ex.submit(...)` kjører denne
+    HTTP-runden sekvensielt i hovedtråden, ett element om gangen - de
+    MAX_WORKERS parallelle arbeiderne fikk dermed aldri noe å gjøre før
+    hele kjeden av sesjonsoppsett (ett per sak, opptil ~14000 for Larvik
+    bygg) var ferdig oppSATT, ikke bare ferdig BRUKT. Med denne wrapperen
+    skjer selve make_session()-kallet PARALLELT i arbeidertrådene, slik at
+    trådpoolen faktisk brukes til det den er ment for."""
+    session = make_session()
+    return fetch_case(session, kilde_key, identifier, hent_filer)
+
+
 def load_done(output_file):
     if not output_file.exists():
         return {}
@@ -691,11 +710,20 @@ def _parse_dato(dato_str):
 
 
 def run_full_dump(kilde_key, output_file, limit=None, from_date=None, to_date=None,
-                   save_every=200, hent_filer=None):
+                   save_every=25, hent_filer=None):
     """Full historisk dump for én kilde. limit=N henter kun de N nyeste
     (stopper paginering tidlig, se get_case_list). from_date/to_date
     (YYYY-MM-DD) filtrerer LOKALT på sakslistas "dato"-felt - krever at hele
-    lista hentes først."""
+    lista hentes først.
+
+    save_every=25 (ned fra 200): skriver den (gjenopptakbare) output-fila
+    til disk mye oftere, slik at man kan følge fremdriften i sanntid ved å
+    åpne fila underveis - avveiningen er at HVER lagring skriver HELE
+    resultatlista på nytt (ikke bare de nye postene), så en for lav verdi
+    (f.eks. 1) ville gjort selve skrivingen til en O(n²)-kostnad mot slutten
+    av en stor dump. 25 er en praktisk mellomting: for Larvik bygg (~14000
+    saker) blir det et par hundre skrivinger i stedet for ~70, uten å gjøre
+    fila unødvendig treg å skrive mot slutten av kjøringen."""
     if from_date or to_date:
         items = get_case_list(kilde_key)
     else:
@@ -726,7 +754,12 @@ def run_full_dump(kilde_key, output_file, limit=None, from_date=None, to_date=No
 
     done = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(fetch_case, make_session(), kilde_key, i, hent_filer): i for i in todo}
+        # NB: submit() kalles her uten å gjøre noe blokkerende arbeid selv
+        # (selve make_session()-kallet skjer inni _fetch_case_new_session,
+        # altså PÅ arbeidertråden) - se _fetch_case_new_session-docstringen
+        # for hvorfor dette er avgjørende for at MAX_WORKERS faktisk gir
+        # parallell hastighet.
+        futures = {ex.submit(_fetch_case_new_session, kilde_key, i, hent_filer): i for i in todo}
         for fut in as_completed(futures):
             res = fut.result()
             results[res["document_id"]] = res
@@ -841,7 +874,11 @@ def run_daily(kilde_key, state_file, output_dir, window_days=WINDOW_DAYS, today_
 
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(fetch_case, make_session(), kilde_key, i) for i in kandidat_ids]
+        # Se _fetch_case_new_session-docstringen (samme fiks som i
+        # run_full_dump) - unngår at make_session() sitt HTTP-kall skjer
+        # sekvensielt i hovedtråden for hver kandidat før noe som helst
+        # sendes til trådpoolen.
+        futures = [ex.submit(_fetch_case_new_session, kilde_key, i) for i in kandidat_ids]
         for fut in as_completed(futures):
             results.append(fut.result())
 

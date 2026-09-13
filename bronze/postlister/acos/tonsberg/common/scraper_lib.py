@@ -103,7 +103,12 @@ def _split_tittel(tittel):
     return [s for s in segs if s]
 
 
-_GBNR_PREFIX_RE = re.compile(r"^\s*g\s*bnr\.?\s*", re.IGNORECASE)
+# Både "Gbnr NN/NN" (forkortet) og fullt utskrevet "gnr/bnr NN/NN" brukes
+# om hverandre som etikett rett foran selve tallet ("Hogsnesveien 3 -
+# gnr/bnr 49/64 - ..." - uten dette ble "gnr/bnr" stående igjen som en
+# meningsløs "adresse" foran selve tallet, og den ekte adressen i det
+# FORRIGE segmentet ("Hogsnesveien 3") ble aldri nådd, se rapport).
+_GBNR_PREFIX_RE = re.compile(r"^\s*(?:g\s*bnr|gnr\s*/\s*bnr)\.?\s*", re.IGNORECASE)
 _MFL_SUFFIX_RE = re.compile(r"\s*m\.?\s*/?\s*fl\.?\s*$", re.IGNORECASE)
 _RE_PREFIX_RE = re.compile(r"^\s*re\s*-\s*", re.IGNORECASE)
 # Et sjeldent observert alternativt/tidligere gnr/bnr i parentes
@@ -259,13 +264,190 @@ _SPACED_PAIR_RE = re.compile(r"^(.+?)\s+(\d+[A-Za-zæøåÆØÅ]?)\s+-\s+(\d+[A-
 # hengende igjen i gate-gruppen ("Åslyveien 3A, 3B, 3C, 3D; Åslyveien 3A,
 # 3B, 3C, 3E" i stedet for fem separate adresser) - bekreftet av ekte data
 # i bygg_ny/tilsyn_ny/tonsberg_hist/re_hist.
+#
+# Listeleddet godtar i tillegg en BAR bokstav uten eget tall ("1C, D, E",
+# "3 A, B, C", "29 A, B og C" - bokstaven arver TALL-delen av forrige
+# fullstendige husnummer i lista, se _utvid_nummer_liste). Uten dette
+# matchet ikke hele "nums"-uttrykket i det hele tatt så snart ett eneste
+# listeledd manglet sitt eget tall, og HELE adressen ble stående uendret
+# og usplittet (se rapport - tre rapporterte titler av nøyaktig dette
+# mønsteret).
 _HUSNR_RE = r"\d+[A-Za-zæøåÆØÅ]?"
+_LISTELEDD_RE = rf"(?:{_HUSNR_RE}|[A-Za-zæøåÆØÅ])"
+# Skilletegn mellom listeledd: komma, "og", "&", eller et komma RETT FØR et
+# avsluttende "og" (oxford-komma, "25A, B, C, og F") - forsøkt i akkurat
+# denne rekkefølgen (lengste/mest spesifikke first) slik at ",og" alltid
+# fanges som ÉN kombinert overgang i stedet for at komma-alternativet
+# feilaktig "vinner" og lar den påfølgende "og"-teksten stå igjen uforbrukt
+# (se rapport). Én enkelt, felles overgangs-struktur brukes for HELE lista
+# i stedet for det tidligere spesialtilfellet "must end in og X" - uten
+# dette ble ikke flere uavhengige tall-grupper i samme liste ("35A og B,
+# 37A og B", "60 E & F, 62 B, C, D, E & F, ...") gjenkjent i det hele tatt,
+# siden hver "og"-bolk da måtte stå HELT til slutt i uttrykket. Semikolon
+# ("16A;B;C;D") forekommer sjeldent i kildedata som et rent skrivevalg,
+# funksjonelt identisk med komma her - lagt til samme sted (se rapport).
+_LISTE_SEP = r"(?:,\s*og|,|;|og|&)"
+# Et enkelt-bokstav listeledd rett bak et komma, men med et RENT
+# mellomrom (ikke komma/og) foran DET NESTE listeleddet - en glemt komma i
+# selve kildedataen ("18 G, I J og K" - mangler komma mellom "I" og "J",
+# se rapport). Kun trygt å rette opp NÅR gapet står MELLOM en eksisterende
+# ", "-liste og en avsluttende " og "-overgang (samme presise plassering
+# som i det observerte tilfellet) - for smalt til å ramme vanlig
+# løpetekst med spredte enbokstavsord ("i", "å").
+_BOKSTAV_MELLOMROM_GLIPP_RE = re.compile(
+    r"(?<=,\s)([A-Za-zæøåÆØÅ])\s+(?=[A-Za-zæøåÆØÅ]\s+og\b)"
+)
 _MULTI_NUM_LIST_RE = re.compile(
-    rf"^(?P<gate>.+?)\s+(?P<nums>{_HUSNR_RE}(?:\s*,\s*{_HUSNR_RE})*\s+og\s+{_HUSNR_RE}"
-    rf"|{_HUSNR_RE}(?:\s*,\s*{_HUSNR_RE})+)$",
+    rf"^(?P<gate>.+?)\s+(?P<nums>{_LISTELEDD_RE}(?:\s*{_LISTE_SEP}\s*{_LISTELEDD_RE})+)$",
     re.IGNORECASE,
 )
-_HUSNR_FINDALL_RE = re.compile(_HUSNR_RE, re.IGNORECASE)
+# Posisjons-forankret tokenizer for selve "nums"-uttrykket over (samme
+# prinsipp som Moss sin tilsvarende bokstavliste-utvidelse): hvert ledd må
+# starte NØYAKTIG der forrige ledd sluttet (m.start() == pos), og en fanget
+# bokstav kan ALDRI være direkte etterfulgt av enda en bokstav/tall - uten
+# denne sperren ble "o" i skilleordet "og" (f.eks. i "32 og 34") lest som
+# et falskt bokstavsuffiks (se tilsvarende, tidligere funnet Moss-bug).
+_LISTE_LEDD_RE = re.compile(
+    rf"(?:^|\s*{_LISTE_SEP}\s*)"
+    r"(?:(?P<tall>\d+)(?P<bokstav1>[A-Za-zæøåÆØÅ])?(?![A-Za-zæøåÆØÅ0-9])"
+    r"|(?P<bokstav2>[A-Za-zæøåÆØÅ])(?![A-Za-zæøåÆØÅ0-9]))",
+    re.IGNORECASE,
+)
+# "med flere"/"m.fl." rett bak en adresse-tall-liste ("Fylkingen 32 og 34
+# med flere") er en beskrivende hale, ikke en del av selve adressen - egen
+# variant av gnr/bnr-modulens tilsvarende _MFL_SUFFIX_RE siden den KUN
+# godtar den forkortede "m.fl."-formen, ikke fullt utskrevet "med flere"
+# (se rapport).
+_MFL_ADRESSE_RE = re.compile(r"\s*(?:med\s+flere|m\.?\s*/?\s*fl\.?)\s*$", re.IGNORECASE)
+# Et bruksenhetsnummer ("H0201", "H0101" - Norsk-adresse-standardens
+# bokstav+4-sifret enhetskode) rett bak husnummeret, skilt med komma, er en
+# presisering av HVILKEN enhet i bygget saken gjelder - ikke en del av
+# selve gateadressen ("Anders Larsens gate 6 C, H0201" -> ønsket "Anders
+# Larsens gate 6C", se rapport). Krever minst to sifre for å ikke
+# forveksle med en ekte bokstav-listefortsettelse ("D" i "12A, B, C, D" -
+# bruksenhetskoder har alltid flere sifre, bokstav-listeledd har aldri
+# noen).
+_BRUKSENHET_HALE_RE = re.compile(r"\s*,\s*[A-Za-zæøåÆØÅ]\d{2,}\s*$")
+# Et "til X"-uttrykk ("Narverødveien 55A til S") antyder et helt bygg-
+# spenn av enheter (A til S - potensielt inntil 19 bokstaver), men uten en
+# eksplisitt komma-/og-liste er det umulig å vite AKKURAT hvilke bokstaver
+# som faktisk er i bruk uten å gjette - i stedet for å forkaste hele
+# adressen fjernes kun selve "til X"-halen, og selve husnummeret ("55A")
+# beholdes som en bekreftet, om enn ufullstendig, adresse (se rapport).
+_TIL_HALE_RE = re.compile(r"\s+til\s+[A-Za-zæøåÆØÅ]\s*$", re.IGNORECASE)
+# Samme "ender på et ekte husnummer"-sperre som Moss (se der for full
+# begrunnelse) - kreves for å skille en REELL adresse fra en tittel som
+# bare har et tall et sted i seg uten at det fungerer som et husnummer
+# ("Sparebank 1 Sør-Norge" - "1" er del av et bankmerkenavn, ikke et
+# gatenummer, se rapport).
+_ENDS_WITH_HUSNR_RE = re.compile(
+    r"(?<!\S)\d+[A-Za-zæøåÆØÅ]?(?:\s*[-/]\s*(?:\d+[A-Za-zæøåÆØÅ]?|[A-Za-zæøåÆØÅ]))*\s*$"
+)
+_STARTS_UPPER_RE = re.compile(r"^[A-ZÆØÅ]")
+# Avsluttende parentes ("(tidligere Barkåkerveien 71)", "(gjelder også
+# 1002/567 og 1002/241)", "(KV1)") er et tilleggsnotat/prosjektkode, ikke
+# selve adressen - fjernes FØR husnummer-sjekken, ellers traff den den
+# bokstavelige ")" på slutten og forkastet en ellers gyldig adresse helt
+# (samme mønster som Moss, se rapport).
+_TRAILING_PAREN_RE = re.compile(r"\s*\([^)]*\)\s*$")
+# Et segment som er en BAR tall-/bokstavliste-fortsettelse UTEN eget
+# gatenavn ("18" i "Heimskringla 16 - 18", "3 A, 3 B, 3 C og 3 D" i "Veg
+# 1630 - 3 A, 3 B, 3 C og 3 D") - brukes til å skille en ekte fortsettelse
+# fra et segment som TILFELDIGVIS inneholder et tall, men faktisk er en
+# beskrivelse ("16 boenheter", "seksjon 4", "leilighet 34" har alle et
+# tall, men er ikke adresse-fortsettelser - uten denne strengere sjekken
+# ble hele kandidaten forkastet, ELLER en slik beskrivelse feilaktig limt
+# inn i adressen og ødela den avsluttende husnummer-sjekken, se rapport).
+# Gjenbruker nøyaktig samme liste-grammatikk som selve tall-/bokstavlisten
+# over (_LISTELEDD_RE/_LISTE_SEP) - normaliseres FØRST med
+# _NUM_LETTER_SPACE_RE ("3 A" -> "3A") slik at et listeledd med mellomrom
+# foran bokstaven ("Veg 1630 - 3 A, 3 B, ...") gjenkjennes, se
+# _ferdigstill_adresse.
+_BAR_FORTSETTELSE_RE = re.compile(
+    rf"^{_LISTELEDD_RE}(?:\s*{_LISTE_SEP}\s*{_LISTELEDD_RE})*$",
+    re.IGNORECASE,
+)
+# Etikett-ord ("felt N", "kapittel N", "tomt N") rett foran et tall som
+# EGENTLIG ikke er et husnummer, men et prosjekt-/tomtenummer - samme
+# mønster og motivasjon som Moss sin tilsvarende sperre (se der), portert
+# hit siden Tønsberg til nå kun luket disse ut indirekte via
+# _ENDS_WITH_HUSNR_RE sin "bokstav rett før tallet"-sperre, som IKKE
+# dekker et MELLOMROM-skilt etikettall ("Skjeggestadåsen felt 4 tomt 10" -
+# både "felt 4" og "tomt 10" har mellomrom foran selve tallet, og det
+# siste, "10", sto ellers igjen som en tilsynelatende gyldig avsluttende
+# husnummer siden det ikke er glidd sammen med noen bokstav, se rapport).
+_IKKE_HUSNR_ETIKETT_RE = re.compile(
+    r"\b(?:felt|kapittel|tomt)\s*[A-Za-zæøåÆØÅ]?\d", re.IGNORECASE
+)
+# Et segment som starter med "Sameiet " er selve sameiets eget registrerte
+# navn, ikke en pålitelig adresse - navnet kan inneholde et tall som ser ut
+# som et husnummer ("Sameiet Innseilingen 2") uten at det nødvendigvis er
+# den fysiske adressen til AKKURAT denne saken (som har sin egen,
+# uavhengige gnr/bnr) - avvist i sin helhet fremfor å gjette, se rapport.
+_SAMEIET_PREFIX_RE = re.compile(r"^Sameiet\b", re.IGNORECASE)
+
+
+def _utvid_nummer_liste(gate, nums):
+    """Bygger 'Gate N1; Gate N2[; ...]' fra en tall-/bokstav-liste der bare
+    bokstaver arver TALL-delen av forrige fullstendige husnummer (se
+    _LISTELEDD_RE/_LISTE_LEDD_RE). Returnerer None (ingen gjetting) hvis
+    lista ikke lar seg dekke FULLSTENDIG av dette mønsteret, eller hvis den
+    første bokstaven i lista mangler et tall å arve fra."""
+    resultat = []
+    current_num = None
+    pos = 0
+    for m in _LISTE_LEDD_RE.finditer(nums):
+        if m.start() != pos:
+            return None
+        pos = m.end()
+        if m.group("tall"):
+            current_num = m.group("tall")
+            resultat.append(f"{gate} {current_num}{m.group('bokstav1') or ''}")
+        else:
+            if current_num is None:
+                return None
+            resultat.append(f"{gate} {current_num}{m.group('bokstav2')}")
+    if pos != len(nums) or len(resultat) < 2:
+        return None
+    return "; ".join(resultat)
+
+
+def _utvid_nummer_liste_over_segmenter(gate, forste_num, segmenter):
+    """Som _utvid_nummer_liste, men fordelt over FLERE separate,
+    bindestrek-splittede segmenter i stedet for én sammenhengende
+    "nums"-streng ("Storgaten 12A - B og C" - bindestreken mellom "12A" og
+    "B og C" kommer fra selve tittel-splittingen, ikke fra et av de vanlige
+    listeskilletegnene komma/og/&/semikolon, men skal likevel telle som en
+    listeovergang siden segmentene allerede er atskilt av en ekte
+    bindestrek i tittelen). `forste_num` er tallet+evt. bokstav fra det
+    FØRSTE segmentet ("12A"); resten av lista hentes ett listeledd om
+    gangen fra `segmenter`, med samme bokstav-arver-forrige-tall-regel som
+    _utvid_nummer_liste. Brukes KUN som fallback av _ferdigstill_adresse,
+    etter at den vanlige sammenslåtte valideringen allerede har feilet -
+    se der for hvorfor (unngår å endre noe som allerede var riktig)."""
+    m_tall = re.match(r"\d+", forste_num)
+    if not m_tall:
+        return None
+    resultat = [f"{gate} {forste_num}"]
+    current_num = m_tall.group()
+    for seg in segmenter:
+        pos = 0
+        funnet = False
+        for m in _LISTE_LEDD_RE.finditer(seg):
+            if m.start() != pos:
+                return None
+            pos = m.end()
+            funnet = True
+            if m.group("tall"):
+                current_num = m.group("tall")
+                resultat.append(f"{gate} {current_num}{m.group('bokstav1') or ''}")
+            else:
+                resultat.append(f"{gate} {current_num}{m.group('bokstav2')}")
+        if not funnet or pos != len(seg):
+            return None
+    if len(resultat) < 2:
+        return None
+    return "; ".join(resultat)
 
 
 def _utvid_flere_adresser(adresse):
@@ -280,10 +462,9 @@ def _utvid_flere_adresser(adresse):
         return adresse
     m = _MULTI_NUM_LIST_RE.match(adresse)
     if m:
-        gate = m.group("gate").strip()
-        numre = _HUSNR_FINDALL_RE.findall(m.group("nums"))
-        if len(numre) >= 2:
-            return "; ".join(f"{gate} {n}" for n in numre)
+        utvidet = _utvid_nummer_liste(m.group("gate").strip(), m.group("nums"))
+        if utvidet:
+            return utvidet
     m = _SPACED_PAIR_RE.match(adresse)
     if m:
         gate = m.group(1).strip()
@@ -291,28 +472,156 @@ def _utvid_flere_adresser(adresse):
     return adresse
 
 
-def _ferdigstill_adresse(adresse):
-    """Siste steg for enhver kandidat-adresse: trim tegnsetting, normaliser
-    nummer+bokstav-mellomrom, ekspander evt. "N1 og/- N2"-adressepar, og
-    forkast kandidater som ikke inneholder et husnummer i det hele tatt
-    (stedsnavn/bygningsnavn/saksbeskrivelser - samme prinsipp som
-    Sandefjord)."""
-    if not adresse:
+def _valider_adressesegment(tekst):
+    """Sluttbehandling av ETT enkelt kandidat-segment: fjerner en
+    avsluttende "med flere"/"m.fl."-hale, avviser et segment som er selve
+    et sameies registrerte navn (_SAMEIET_PREFIX_RE), trunkerer ved en
+    etikett som "felt N"/"tomt N" og prøver resten på nytt
+    (_IKKE_HUSNR_ETIKETT_RE), fjerner en bruksenhetskode
+    (_BRUKSENHET_HALE_RE) eller et "til X"-spenn (_TIL_HALE_RE) rett bak
+    husnummeret, normaliserer nummer+bokstav-mellomrom, retter en glemt
+    komma i en bokstavliste (_BOKSTAV_MELLOMROM_GLIPP_RE), ekspanderer evt.
+    tall-/bokstavlister eller "-"-par, og krever til slutt at (hver
+    "; "-skilte del av) resultatet faktisk ENDER på et gyldig
+    husnummer-mønster - ikke bare at det finnes et tall ET STED i teksten
+    (se _ENDS_WITH_HUSNR_RE og rapport: "Sparebank 1 Sør-Norge" har et
+    tall, men er ikke en adresse). Hvis dette feiler og teksten inneholder
+    " / " (to gatenavn-alternativer, "Grev Wedels gate 12 / Tollbodgaten"),
+    valideres hver side for seg som en siste utvei - se rapport."""
+    if not tekst:
         return None
-    adresse = adresse.strip().strip(",.;:").strip()
-    if not adresse or not _HAS_DIGIT_RE.search(adresse):
+    tekst = _TRAILING_PAREN_RE.sub("", tekst).strip()
+    tekst = _MFL_ADRESSE_RE.sub("", tekst).strip()
+    tekst = tekst.strip(",.;:").strip()
+    if not tekst:
         return None
-    adresse = _NUM_LETTER_SPACE_RE.sub(r"\1\2", adresse)
-    return _utvid_flere_adresser(adresse)
+    if _SAMEIET_PREFIX_RE.match(tekst):
+        return None
+    m_etikett = _IKKE_HUSNR_ETIKETT_RE.search(tekst)
+    if m_etikett:
+        return _valider_adressesegment(tekst[:m_etikett.start()])
+    tekst = _BRUKSENHET_HALE_RE.sub("", tekst).strip()
+    tekst = _TIL_HALE_RE.sub("", tekst).strip()
+    tekst = _NUM_LETTER_SPACE_RE.sub(r"\1\2", tekst)
+    tekst = _BOKSTAV_MELLOMROM_GLIPP_RE.sub(r"\1, ", tekst)
+    utvidet = _utvid_flere_adresser(tekst)
+    deler = [d.strip() for d in utvidet.split(";") if d.strip()]
+    if deler and all(_ENDS_WITH_HUSNR_RE.search(d) for d in deler):
+        return utvidet
+    if " / " in tekst:
+        godkjente = [
+            g for g in (_valider_adressesegment(d) for d in tekst.split(" / ")) if g
+        ]
+        if godkjente:
+            return "; ".join(godkjente)
+    return None
+
+
+def _ferdigstill_adresse(segmenter):
+    """Siste steg for enhver kandidat-adresse. `segmenter` kan være en
+    enkelt streng eller en LISTE av rå, '-'-delte segmenter (flere
+    segmenter oppstår når adresseblokken ikke står først i tittelen, se
+    _adresse_fra_blokk). Rene beskrivelses-/bygnings-/stedsnavn-segmenter
+    UTEN noe tall i det hele tatt ("Husøy Havn" i "Strandveien 29 - Husøy
+    Havn", "Sem jernbanestasjon" i "Sem jernbanestasjon - Døvleveien 27",
+    "Grand Apartment Tønsberg" i "Grand Apartment Tønsberg - Øvre Langgate
+    65") filtreres bort FØR selve sammenslåingen - uten dette ble ALL tekst
+    foran en funnet gnr/bnr-blokk godtatt som adresse uansett, se rapport.
+
+    Når to eller flere segmenter hver for seg SER UT som en selvstendig
+    adresse (starter med stor bokstav OG har sitt eget tall), utvides og
+    valideres de HVER FOR SEG og slås sammen med "; " - typisk to ulike
+    gater limt sammen med bindestrek ("Fylkingen 32 og 34 med flere -
+    Fagerskinna 1, 3, 5 og 7", se rapport). Uten dette ble et tall-listen i
+    ETT segment feilaktig utvidet med HELE det sammenslåtte prefikset
+    (inkludert et helt urelatert tidligere gatenavn) som "gatenavn", siden
+    ekspansjon da først skjedde ETTER sammenslåing til én lang streng.
+
+    Ellers (0 eller 1 slikt segment) bygges én sammenslått kandidat av KUN
+    segmentene som enten (a) selv ser ut som en selvstendig adresse, eller
+    (b) er en BAR tall-/bokstavliste-fortsettelse uten noe annet ord
+    (_BAR_FORTSETTELSE_RE, f.eks. "18" i "Heimskringla 16 - 18", eller
+    "3 A, 3 B, 3 C og 3 D" i "Veg 1630 - 3 A, 3 B, 3 C og 3 D" - må bli med
+    for at hhv. dash-par-mønsteret (_SPACED_PAIR_RE) og tall-/bokstavlisten
+    (_MULTI_NUM_LIST_RE) fortsatt gjenkjenner det som ett gatenavn+flere
+    husnummer). Rene beskrivelses-, bygnings- eller stedsnavn-segmenter
+    UTEN noe tall i det hele tatt ("Husøy Havn", "Sem jernbanestasjon",
+    "Bruaåsen") ELLER som bare TILFELDIGVIS inneholder et tall midt i en
+    beskrivelse ("16 boenheter", "seksjon 4", "leilighet 34", "(hus 1-2)")
+    droppes stille - uten dette ble slike segmenter slått sammen inn i
+    adressen og enten ødela den avsluttende husnummer-sjekken for en ellers
+    gyldig adresse ("Askeladden 2, 4, ..., 31 - 16 boenheter", "Bruaåsen -
+    Melsomvikveien 425 - (hus 1-2)"), eller ble stående igjen som en
+    misvisende hale på en ellers korrekt adresse ("Lerches gate 2 -
+    seksjon 4", "Grevinneveien 16H - leilighet 34"), se rapport."""
+    if segmenter is None:
+        return None
+    if isinstance(segmenter, str):
+        segmenter = [segmenter]
+    segmenter = [s.strip().strip(",.;:").strip() for s in segmenter if s and s.strip()]
+    # Normaliser tall+bokstav-mellomrom ("3 A" -> "3A") FØR klassifisering,
+    # slik at et listeledd med mellomrom foran bokstaven gjenkjennes av
+    # _BAR_FORTSETTELSE_RE nedenfor (samme normalisering gjentas trygt,
+    # men virkningsløst, inne i _valider_adressesegment).
+    segmenter = [_NUM_LETTER_SPACE_RE.sub(r"\1\2", s) for s in segmenter if s]
+    segmenter = [s for s in segmenter if s]
+    if not segmenter:
+        return None
+
+    if len(segmenter) == 1:
+        return _valider_adressesegment(segmenter[0])
+
+    def _er_selvstendig(s):
+        return bool(_STARTS_UPPER_RE.match(s) and _HAS_DIGIT_RE.search(s))
+
+    selvstendige = [s for s in segmenter if _er_selvstendig(s)]
+    if len(selvstendige) >= 2:
+        godkjente = [g for g in (_valider_adressesegment(s) for s in selvstendige) if g]
+        return "; ".join(godkjente) if godkjente else None
+
+    behold = [
+        s for s in segmenter
+        if _er_selvstendig(s) or _BAR_FORTSETTELSE_RE.match(s)
+    ]
+    if not behold:
+        return None
+    resultat = _valider_adressesegment(" - ".join(behold))
+    if resultat:
+        return resultat
+
+    # Fallback, kun forsøkt når den vanlige sammenslåtte valideringen over
+    # feilet: en BAR bokstavliste-fortsettelse rett etter bindestrek, UTEN
+    # noe eget tall noe sted i fortsettelsen ("Storgaten 12A - B og C" - i
+    # motsetning til "Veg 1630 - 3A, 3B, 3C og 3D", der fortsettelsen har
+    # SINE EGNE tall og ikke skal arve noe). `_MULTI_NUM_LIST_RE` over
+    # klarer ikke dette fordi dens ikke-grådige gate-fangst ikke vet at
+    # nettopp DETTE tallet, "12A", skal være ankeret - løst ved å bygge
+    # lista eksplisitt fra det første segmentets eget gatenavn+tall i
+    # stedet for å stole på at regex finner riktig delingspunkt selv.
+    if len(behold) >= 2 and not any(_HAS_DIGIT_RE.search(s) for s in behold[1:]):
+        forste_rens = _MFL_ADRESSE_RE.sub(
+            "", _TRAILING_PAREN_RE.sub("", behold[0]).strip()
+        ).strip()
+        m_forste = re.match(rf"^(?P<gate>.+?)\s+(?P<num>{_HUSNR_RE})$", forste_rens)
+        if m_forste:
+            utvidet = _utvid_nummer_liste_over_segmenter(
+                m_forste.group("gate").strip(), m_forste.group("num"), behold[1:]
+            )
+            if utvidet:
+                deler = [d.strip() for d in utvidet.split(";") if d.strip()]
+                if deler and all(_ENDS_WITH_HUSNR_RE.search(d) for d in deler):
+                    return utvidet
+    return None
 
 
 def _adresse_fra_blokk(segs, start, end):
     """Adressen er alt FØR blokken hvis blokken ikke står først (Moss-stil,
-    flere adresse-segmenter slås sammen med ' - '), ellers det FØRSTE
-    segmentet etter blokken som ikke selv bare er en gnr/bnr-fortsettelse
-    (Sandefjord-ny-stil, se _er_gnrbnr_segment)."""
+    returnert som RÅ SEGMENT-LISTE - se _ferdigstill_adresse for hvorfor
+    sammenslåing ikke skjer her), ellers det FØRSTE segmentet etter blokken
+    som ikke selv bare er en gnr/bnr-fortsettelse (Sandefjord-ny-stil, se
+    _er_gnrbnr_segment)."""
     if start > 0:
-        return " - ".join(segs[:start])
+        return segs[:start]
     for kandidat in segs[end + 1:]:
         if _er_gnrbnr_segment(kandidat):
             continue
@@ -386,6 +695,60 @@ def _finn_gnrbnr_blokk_innbakt(segs):
     return None, None, None
 
 
+_TODELT_GNRBNR_OG_NUM_RE = re.compile(
+    rf"^(?P<gnr1>{_TOKEN})\s+og\s+(?P<num2>\d+)\s*(?P<bokstav2>[A-Za-zæøåÆØÅ])\s*$",
+    re.IGNORECASE,
+)
+
+
+def _prov_todelt_adresse_gnrbnr(segs):
+    """Fanger et sjeldent, men reelt mønster der TO adresser - hver med sin
+    EGEN gnr/bnr - er vevd sammen i tittelen med "og" MIDT I selve gnr/bnr-
+    delen i stedet for at hele andre-adressen gjentas fullt ut
+    ("Karlsvikveien 21 A - 133/52 og 21 B - 133/11 - oppføring av
+    enebolig" - andre adresse, "21 B", er bare et bart tall+bokstav som
+    arver gatenavnet fra den FØRSTE adressen, se rapport). Bokstaven i
+    "num2 bokstav2" er OBLIGATORISK (til forskjell fra
+    _TODELT_GNRBNR_OG_NUM_RE sin lillebror-bruk andre steder) nettopp for å
+    skille dette fra det langt vanligere, allerede riktig håndterte
+    mønsteret der "og N" er en ANDRE bnr/seksjon under SAMME eiendom
+    ("1009/56/0/1 og 2" - "2" er seksjonsnummer, ikke et husnummer, se
+    _GNRBNR_LIST_FULL_RE) - uten bokstav-kravet ville denne funksjonen
+    feilaktig også trigget på slike, langt hyppigere titler.
+    Returnerer (adresse, gnr_bnr_liste, matrikkel_liste), eller
+    (None, None, None) hvis mønsteret ikke finnes. Kalt FØR den vanlige
+    _finn_gnrbnr_blokk, siden det midterste segmentet ("133/52 og 21 B")
+    ikke er en ren gnr/bnr-blokk (_er_gnrbnr_segment) og derfor aldri ville
+    blitt funnet av den."""
+    for i in range(1, len(segs) - 1):
+        m = _TODELT_GNRBNR_OG_NUM_RE.match(segs[i])
+        if not m:
+            continue
+        if not _er_gnrbnr_segment(segs[i + 1]):
+            continue
+        forste_norm = _NUM_LETTER_SPACE_RE.sub(r"\1\2", segs[i - 1].strip())
+        m_gate = re.match(rf"^(?P<gate>.+?)\s+(?P<num>{_HUSNR_RE})$", forste_norm)
+        if not m_gate:
+            continue
+        adresse1 = _ferdigstill_adresse(segs[i - 1])
+        if not adresse1:
+            continue
+        gnr1, matrikkel1 = _parse_gnrbnr_expr(m.group("gnr1"))
+        gnr2, matrikkel2 = _parse_gnrbnr_expr(segs[i + 1])
+        if not gnr1 or not gnr2:
+            continue
+        adresse2 = _ferdigstill_adresse(
+            f"{m_gate.group('gate')} {m.group('num2')}{m.group('bokstav2')}"
+        )
+        if not adresse2:
+            continue
+        adresse = f"{adresse1}; {adresse2}"
+        gnr_bnr = gnr1 + [p for p in gnr2 if p not in gnr1]
+        matrikkel = matrikkel1 + [d for d in matrikkel2 if d not in matrikkel1]
+        return adresse, gnr_bnr, matrikkel
+    return None, None, None
+
+
 def _parse_generisk(tittel, gnr_offset=0):
     """Posisjons-uavhengig fallback-parser: finner gnr/bnr-blokken (foran
     ELLER bak adressen) via segment-skanning. Brukt direkte av (a)/(b), og
@@ -396,6 +759,11 @@ def _parse_generisk(tittel, gnr_offset=0):
     segs = _split_tittel(tittel)
     if not segs:
         return None, None, None
+    adresse, gnr_bnr, matrikkel = _prov_todelt_adresse_gnrbnr(segs)
+    if adresse:
+        if gnr_offset and gnr_bnr:
+            gnr_bnr, matrikkel = _med_gnr_offset(gnr_bnr, gnr_offset), _med_gnr_offset(matrikkel, gnr_offset)
+        return adresse, (gnr_bnr or None), _matrikkelnr(matrikkel)
     start, end, gnr_bnr, matrikkel = _finn_gnrbnr_blokk(segs)
     if start is None:
         start, end, gnr_bnr, matrikkel = _finn_gnrbnr_blokk_lopende(segs)
@@ -438,7 +806,27 @@ def parse_adresse_ny(tittel, subtitle=None):
 def parse_adresse_tonsberg_hist(tittel, subtitle=None):
     """Tønsberg historisk 2006-2019 - se modul-docstring punkt (b). Samme
     generelle parser som (a); zero-padding håndteres av _avpad inni
-    _parse_gnrbnr_expr uansett kilde."""
+    _parse_gnrbnr_expr uansett kilde.
+
+    Et mindretall saker (38 av 12271 ved verifisering 2026-09-03, samtlige
+    med et "RE -"/"Re -"-prefiks i tittelen) er egentlig FEILARKIVERTE
+    gamle Re-saker som har havnet i Tønsberg sitt eget historiske arkiv i
+    stedet for re_hist - bekreftet ved kryssjekk mot dagens (2020-nå)
+    system: 12 av disse sakene sin adresse finnes IGJEN i dagens data med
+    et gnr som er PRESIST +300 høyere enn det som står i den gamle
+    tittelen her ("RE - Heianveien 325 - 251/1" her mot "Heianveien 325 -
+    gnr/bnr 551/1" i dagens bygg_ny, 551-251=300), og Kartverket sin
+    offisielle "Endringer i gårdsnummer i nye og sammenslåtte kommuner"
+    (kartverket.no) bekrefter at 0716 Re fikk nøyaktig dette +300-tillegget
+    ved sammenslåingen inn i 0704 Tønsberg -> 3803 Tønsberg (Tønsberg sitt
+    eget gnr uendret, +0 - begge tall dermed bekreftet, ingen endring
+    nødvendig i selve offset-verdiene). Uten denne sjekken fikk disse 38
+    sakene et matrikkelnr som pekte på FEIL eiendom under dagens
+    KOMMUNE_NR - delegerer derfor helt til parse_adresse_re_hist (samme
+    prefiks-stripping, komma-format og +300-offset som det ordinære
+    re_hist-arkivet allerede får), se rapport."""
+    if _RE_PREFIX_RE.match(tittel or ""):
+        return parse_adresse_re_hist(tittel, subtitle)
     return _parse_generisk(tittel)
 
 

@@ -754,8 +754,12 @@ def run_full_dump(output_file, saksnummer_prefiks, limit=None, save_every=200):
     errors = sum(1 for r in results.values() if "error" in r)
     print(f"Ferdig: {len(results)} saker skrevet til {output_file} ({errors} feilet)")
 
-    if limit is None:   # ikke last opp delkjøringer/lokal test til Azure
-        upload_full_dump_til_azure(list(results.values()), saksnummer_prefiks)
+    # Azure-opplasting er BEVISST frakoblet her - kjør run_full_dump() rent
+    # lokalt (ingen forsøk på tilkobling). Funksjonen upload_full_dump_til_azure()
+    # står fortsatt klar og er uendret - kall den manuelt når Azure-tilgang er
+    # på plass.
+    # if limit is None:   # ikke last opp delkjøringer/lokal test til Azure
+    #     upload_full_dump_til_azure(list(results.values()), saksnummer_prefiks)
 
 
 # --- Daglig endringslogg (running_daily) - full sveip + snapshot-diff ---

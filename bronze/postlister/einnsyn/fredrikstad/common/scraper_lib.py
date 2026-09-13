@@ -327,11 +327,18 @@ def _mask_eiendom_chunk(tittel):
 # husnummer), eller et nytt tall etter skråstrek ("/53"). Uten bar-bokstav-
 # alternativet godkjennes "16 A-C" ikke (ingen \d rett etter "-"), og uten
 # skråstrek-alternativet godkjennes "51/53" ikke.
+# En avsluttende parentes kan stå enten RETT ETTER husnummeret ("... 5 (tomt
+# 36)") ELLER ETTER det etterfølgende stedsnavnet ("Seierstensgata 21,
+# Sentrum (tidligere Seiersten skole)") - uten den andre, separate parens-
+# gruppa på selve slutten godkjennes ikke sistnevnte rekkefølge (den lazy
+# gatenavn-delen kan ikke "hoppe over" et helt stedsnavn+parentes-forløp i
+# ett, siden stedsnavn-gruppa allerede er forankret med "$", se rapport).
 _HUSNR_SLUTT = re.compile(
     r"^[A-ZÆØÅ].{1,40}?\s(\d{1,4})(?:\s?[A-Za-z])?"
     r"(?:\s*[-/]\s*(?:(\d{1,4})(?:\s?[A-Za-z])?|[A-Za-z]))?"
     r"(?:\s*\(.*\))?"
-    r"(?:,\s*[A-ZÆØÅa-zæøå]+(?:\s+[A-ZÆØÅa-zæøå]+)?)?$"
+    r"(?:,\s*[A-ZÆØÅa-zæøå]+(?:\s+[A-ZÆØÅa-zæøå]+)?)?"
+    r"(?:\s*\(.*\))?$"
 )
 _NO_ADDRESS_PATTERNS = [
     "innsyn", "hms-referater", "bruk av teknologi", "jordskiftesak",
@@ -390,6 +397,21 @@ _LEDENDE_BESKRIVELSE = re.compile(
     r"oppf[øo]rt\s+hytte|planinitiativ)\s+(?:for|i|av|til|med|på)\s+",
     re.IGNORECASE,
 )
+# "Omadressering"/"Adressering" (evt. kombinert "Adressering/omadressering",
+# evt. med "av"/"for" etter) er en byggesakstype som beskriver selve
+# adresseringsprosessen for en konkret adresse ("Omadressering Kjølberggaten
+# 19A-D", "Adressering av ny enebolig - eiendom 211/112 - Brønnerød Terrasse
+# 67") - IKKE en generisk metadata-sak uten egen adresse. Dette ordet inngår
+# derfor IKKE i _NO_ADDRESS_PATTERNS (det ville blokkert den ekte adressen når
+# det ikke finnes noen "Eiendom ..."-blokk å maskere segmentet fra, se
+# rapport: "Omadressering Kjølberggaten 19A-D" har ingen "Eiendom"-etikett og
+# blir dermed ETT sammenhengende segment der leder-ordet ellers ville
+# blokkert hele treffet). I stedet strippes leder-ordet her, samme prinsipp
+# som _LEDENDE_VEINUMMER/_LEDENDE_BESKRIVELSE - resten valideres på nytt.
+_LEDENDE_ADRESSERING = re.compile(
+    r"^(?:om)?adressering(?:\s*/\s*(?:om)?adressering)?(?:\s+(?:av|for))?\s+",
+    re.IGNORECASE,
+)
 
 # Et 4-sifret "husnummer" i årstall-området er så godt som alltid en
 # årsreferanse i en saksarkiv-tittel ("Planutvalget 2020", "Planutvalget
@@ -412,13 +434,20 @@ _NR_BOKSTAV_MELLOMROM = re.compile(r"(\d)\s+([A-Za-zÆØÅæøå])\b")
 # hører til bydel/område, ikke gateadressen, og skal ikke være med i den
 # returnerte "adresse"-verdien.
 _TRAILING_STED = re.compile(r",\s*[A-ZÆØÅa-zæøå]+(?:\s+[A-ZÆØÅa-zæøå]+)?$")
+# Et avsluttende parentetisk innskudd ("(tidligere Seiersten skole)") hører
+# ikke til selve adressen, uansett om det står rett etter husnummeret eller
+# etter et påfølgende stedsnavn (se _HUSNR_SLUTTs andre parens-gruppe) - må
+# fjernes FØR _TRAILING_STED, ellers blokkerer parentesen stedsnavn-fjerningen
+# siden den da ikke lenger står helt til slutt i strengen.
+_TRAILING_PAREN = re.compile(r"\s*\([^)]*\)\s*$")
 
 
 def _rens_adresse(segment):
     """Etterrensk av et allerede validert adressesegment: fjerner et
-    etterfølgende stedsnavn, normaliserer mellomrom foran bokstavsuffiks, og
-    kollapser doble mellomrom som forekommer i enkelte kildetitler
-    ("Paul  Holmsens vei")."""
+    avsluttende parentetisk innskudd og et etterfølgende stedsnavn,
+    normaliserer mellomrom foran bokstavsuffiks, og kollapser doble
+    mellomrom som forekommer i enkelte kildetitler ("Paul  Holmsens vei")."""
+    segment = _TRAILING_PAREN.sub("", segment)
     segment = _TRAILING_STED.sub("", segment).strip()
     segment = _NR_BOKSTAV_MELLOMROM.sub(r"\1\2", segment)
     return re.sub(r"\s+", " ", segment).strip()
@@ -534,7 +563,12 @@ _SEGMENT_SPLIT = re.compile(r"\s[-–]\s")
 _MAKS_SEGMENTER = 6
 
 
-def _er_gyldig_segment(segment):
+def _uten_kjente_avvisninger(segment):
+    """De ikke-strukturelle avvisningssjekkene, delt av _er_gyldig_segment
+    (som i tillegg krever et gyldig _HUSNR_SLUTT-endemønster for ETT
+    husnummer) og _prøv_adresseliste (som i stedet aksepterer en bekreftet
+    multi-adresse-liste, se der - segmentet trenger ikke slutte på ett
+    enkelt husnummer-mønster for å telle som gyldig i den flyten)."""
     if not segment:
         return False
     lav = segment.lower()
@@ -553,8 +587,38 @@ def _er_gyldig_segment(segment):
     m = _TOMT_OMRADE_KVARTAL_DEL.search(segment)
     if m and not re.search(r"\d", segment[: m.start()]):
         return False
+    return True
+
+
+def _er_gyldig_segment(segment):
+    if not _uten_kjente_avvisninger(segment):
+        return False
     match = _HUSNR_SLUTT.match(segment)
     return bool(match) and not _er_arstall(match)
+
+
+def _prøv_adresseliste(segment):
+    """Fallback for segmenter som IKKE slutter på ett enkelt husnummer-
+    mønster (dermed avvist av _er_gyldig_segment), men som likevel er en
+    gjenkjennelig liste av flere adresser i samme gate - enten flere fulle
+    husnummer ("Halvorsrødveien 75, 75A og 75B") eller bare bokstavsuffiks
+    som arver forrige husnummer ("Sportsveien 2B, D og E", "Brønneløkkveien
+    10A,B og C"). _HUSNR_SLUTTs enkle "ett husnummer + maks to ord stedsnavn"
+    -mønster dekker ikke slike lister (halen har mer enn to ord/elementer),
+    men _utvid_flere_adresser (via _SAMME_GATE_LISTE_RE/_split_blandet_liste)
+    gjenkjenner dem allerede - de manglet bare en inngang hit siden de aldri
+    kom seg forbi valideringssteget. Kjører de samme ikke-strukturelle
+    avvisningssjekkene som _er_gyldig_segment, og godtar KUN hvis utvidelsen
+    faktisk gir minst to ";"-skilte adresser (dvs. et bekreftet listemønster
+    - hvis _utvid_flere_adresser ikke klarer å tolke det, returneres
+    segmentet uendret, og det forkastes her i stedet for å slippes gjennom
+    som ett stort, uvalidert "segment")."""
+    if not _uten_kjente_avvisninger(segment):
+        return None
+    utvidet = _utvid_flere_adresser(_rens_adresse(segment))
+    if "; " not in utvidet:
+        return None
+    return utvidet
 
 
 def extract_adresse(sakstittel):
@@ -588,15 +652,27 @@ def extract_adresse(sakstittel):
             segment = navn_m.group(2).strip()
         if _er_gyldig_segment(segment):
             return _utvid_flere_adresser(_rens_adresse(segment))
-        # Segmentet kan ha en kjent leder (veinummer-referanse eller en
-        # beskrivende frase som "Reguleringsplan for ...") rett før den
-        # reelle adressen i SAMME segment - strip lederen og valider resten
-        # på nytt før segmentet forkastes helt.
-        for leder in (_LEDENDE_VEINUMMER, _LEDENDE_BESKRIVELSE):
+        # Segmentet slutter kanskje ikke på ETT husnummer-mønster, men er
+        # likevel en gjenkjennelig liste av flere adresser (se
+        # _prøv_adresseliste) - prøves før lederne under, siden lista ikke
+        # nødvendigvis har noen leder å strippe i utgangspunktet.
+        liste = _prøv_adresseliste(segment)
+        if liste:
+            return liste
+        # Segmentet kan ha en kjent leder (veinummer-referanse, en
+        # beskrivende frase som "Reguleringsplan for ...", eller et
+        # "(om)adressering"-leder-ord) rett før den reelle adressen i SAMME
+        # segment - strip lederen og valider resten på nytt (som ett
+        # husnummer eller som en liste) før segmentet forkastes helt.
+        for leder in (_LEDENDE_VEINUMMER, _LEDENDE_BESKRIVELSE, _LEDENDE_ADRESSERING):
             if leder.match(segment):
                 rest = leder.sub("", segment, count=1).strip()
-                if rest and rest != segment and _er_gyldig_segment(rest):
-                    return _utvid_flere_adresser(_rens_adresse(rest))
+                if rest and rest != segment:
+                    if _er_gyldig_segment(rest):
+                        return _utvid_flere_adresser(_rens_adresse(rest))
+                    liste = _prøv_adresseliste(rest)
+                    if liste:
+                        return liste
     return None
 
 

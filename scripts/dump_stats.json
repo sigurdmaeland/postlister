@@ -1,0 +1,26 @@
+[
+  {
+    "path": "bronze/postlister/acos/larvik/2018-today_dump/bygg/larvik_bygg.json",
+    "n": 14428,
+    "n_adresse": 12926,
+    "pct_adresse": 89.6,
+    "n_gnr_bnr": 14348,
+    "pct_gnr_bnr": 99.4,
+    "n_matrikkelnr": 14348,
+    "pct_matrikkelnr": 99.4,
+    "n_ingen_eiendomsreferanse": 54,
+    "pct_ingen_eiendomsreferanse": 0.4
+  },
+  {
+    "path": "bronze/postlister/acos/larvik/2018-today_dump/tilsyn/larvik_tilsyn.json",
+    "n": 3,
+    "n_adresse": 0,
+    "pct_adresse": 0.0,
+    "n_gnr_bnr": 2,
+    "pct_gnr_bnr": 66.7,
+    "n_matrikkelnr": 2,
+    "pct_matrikkelnr": 66.7,
+    "n_ingen_eiendomsreferanse": 1,
+    "pct_ingen_eiendomsreferanse": 33.3
+  }
+]

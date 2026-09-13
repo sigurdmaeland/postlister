@@ -256,6 +256,19 @@ _GNR_BNR_GROUP = re.compile(r"\d+(?:/\d+){1,3}")
 _GNR_BNR_LIST_PREFIX = re.compile(
     r"^\d+(?:/\d+){1,3}(?:(?:\s*,\s*|\s+og\s+)\d+(?:/\d+){1,3})*\s*"
 )
+# Ekte gnr/bnr i Norge har praktisk talt aldri mer enn 4 sifre per ledd.
+# Kildesystemet (Elements) slår av og til flere adskilte propertyNr/useNr-
+# verdier sammen til ett tall uten skilletegn når en sak har flere
+# eiendommer - bekreftet på ekte data (Asker 22/2756: propertyIdentifications
+# ga ETT par {propertyNr: 212, useNr: 91212} der tittelen "212/91, 212/99,
+# 212/344" tydelig viser tre reelle, separate par). _plausibel_gnr_bnr()
+# brukes til å forkaste slike API-par og falle tilbake på tittel-parsingen,
+# se gnr_bnr_matrikkel().
+_MAKS_SIFRE_GNR_BNR = 4
+
+
+def _plausibel_gnr_bnr(gnr, bnr):
+    return len(str(gnr)) <= _MAKS_SIFRE_GNR_BNR and len(str(bnr)) <= _MAKS_SIFRE_GNR_BNR
 
 
 def _collect_leading_gnr_bnr(tittel):
@@ -331,9 +344,12 @@ def gnr_bnr_matrikkel(property_identifications, tittel=None):
             title_by_pair.setdefault((gnr, bnr), []).append((feste, seksjon))
 
     fra_tittel = False
-    if api_pairs:
-        pairs = api_pairs
+    plausible_api_pairs = [(g, b) for g, b in api_pairs if _plausibel_gnr_bnr(g, b)]
+    if plausible_api_pairs:
+        pairs = plausible_api_pairs
     else:
+        # Enten ingen API-par i det hele tatt, ELLER alle var usannsynlige
+        # (se _plausibel_gnr_bnr) - fall tilbake på tittel-parsingen.
         pairs = []
         for gnr, bnr, _, _ in title_entries:
             if (gnr, bnr) == ("0", "0") or (gnr, bnr) in pairs:
@@ -399,12 +415,13 @@ _DESCRIPTION_MARKERS = re.compile(
     r"dispensasjon|anmodning|henvendelse|riving|anleggelse|"
     r"tomteopparbeidelse|utvidelse|uteservering|ulovlighetsoppfølging|"
     r"fasadeendring|fasadeskilt|tilbygg|nybygg|påbygg|bruksendring|samlesak|"
-    r"innsyn|innsynsbegjæring|innsynsforespørsel|tillatelse|brukstillatelse|"
+    r"innsyn|innsynsbegjæring|innsynsforespørsel|begjæring|tillatelse|"
+    r"brukstillatelse|"
     r"igangsetting|ferdigattest|rammetillatelse|forhåndskonferanse|"
     r"ettergodkjenn\w*|korrespondansemappe|nabomerknad\w*|nabovarsel|"
     r"høring|tilsyn|terrenginngrep|terrengendring|renseanlegg|"
     r"avløpsrenseanlegg|ombygging|grunnarbeider|arealoverføring|"
-    r"svømmebasseng|bekymringsmelding|vesentlig|forenklet|"
+    r"svømmebasseng|bekymringsmelding|vesentlig|forenklet|spørsmål|"
     r"ingen\s+adresse|ukjent\s+adresse)\b",
     re.IGNORECASE,
 )
@@ -421,11 +438,31 @@ _DESCRIPTION_MARKERS = re.compile(
 # fanges av _GARDSNAVN_UTEN_NUMMER (9 forekomster i arkivet, alle reelle
 # gårder, verifisert mot ekte data).
 _GARDSNAVN_UTEN_NUMMER = re.compile(r"\b(?:gård|prestegård|hovedgård)\s*$", re.IGNORECASE)
+# Fjerner mellomrom mellom husnummer og bokstav-suffiks ("12 A" -> "12A"),
+# samme mønster som i Sandnes/andre kommuner - bekreftet på ekte data
+# ("Bakkeløkka 12 A" ble stående med mellomrom). KUN store bokstaver: et
+# husnummer-suffiks er alltid stor bokstav i denne datakilden (aldri sett
+# lowercase), mens ett lowercase-bokstav ETTER et tall ofte er et norsk
+# ettordspreposisjon/-partikkel ("i", "å") - f.eks. "NN2000 i Slemmestad"
+# ble feilaktig til "NN2000i Slemmestad" med [A-Za-z] i mønsteret (funnet og
+# fikset 2026-09-02, se HANDOVER.md).
+_NUM_LETTER_SPACE = re.compile(r"(\d+)\s+([A-ZÆØÅ])\b")
 
 _OG_SPLIT = re.compile(r"^(.+?)\s+og\s+(.+)$")
 _BARE_NUMBER_SUFFIX = re.compile(r"^\d+[A-Za-zæøåÆØÅ]?$")
 _STREET_AND_NUMBER = re.compile(r"^(.*\D)\s*(\d+[A-Za-zæøåÆØÅ]?)$")
 _BARE_GNR_BNR = re.compile(r"^\d+(?:/\d+){1,3}$")
+# Gnr-referanse fremst i tittelen som _GNR_BNR_LIST_PREFIX ikke fanger fordi
+# formatet er uregelmessig - enten bnr mangler ("61/-", bare "80/"),
+# dobbel skråstrek pga. skrivefeil i kilden ("26//200"), eller mellomrom
+# rundt skråstreken ("57/ 89"). Kun for ADRESSE-utrekk (ikke gnr/bnr-
+# parsing - se _GNR_BNR_LIST_PREFIX/parse_title_gnr_bnr, som er strengere med
+# vilje og ikke skal endres her): målet er bare å fjerne prefikset slik at
+# _DESCRIPTION_MARKERS/_clean_adresse ser resten av tittelen fra start.
+# Uten denne fallbacken blir hele det første tittelsegmentet stående (f.eks.
+# "61/- Forespørsel om ...") og treffordet lenger nede står ikke lenger
+# helt fremst - fikset 2026-09-02, se HANDOVER.md.
+_GNR_UKJENT_BNR_PREFIX = re.compile(r"^\d+(?:\s*/\s*-?\d*)+\s*")
 
 
 def _split_og_adresser(s):
@@ -452,6 +489,7 @@ def _clean_adresse(kandidat):
     s = _TRAILING_HUS_BYGG.sub("", s)
     s = _MFL_EDGE.sub(" ", s)
     s = re.sub(r"\s+", " ", s).strip(" ,-")
+    s = _NUM_LETTER_SPACE.sub(r"\1\2", s)
     # "m. flere" (variant av "m.fl." med mellomrom og fullt utskrevet "flere")
     # - normaliser bort punktum/mellomrom og sjekk mot samme sett.
     if not s or re.sub(r"[.\s]+", "", s.lower()) in ("mfl", "mflere"):
@@ -483,11 +521,22 @@ def extract_adresse(tittel):
     if len(segments) < 2:
         return None
     kandidat = _GNR_BNR_LIST_PREFIX.sub("", segments[0])
+    if kandidat == segments[0]:
+        # Ingen fullstendig gnr/bnr fremst - prøv gnr-med-ukjent-bnr-varianten
+        # ("61/-", "80/") før vi gir opp å strippe et prefiks helt.
+        kandidat = _GNR_UKJENT_BNR_PREFIX.sub("", segments[0])
     if not kandidat.strip():
         neste = segments[1].strip()
         if _BARE_GNR_BNR.match(neste):
             return None
-        kandidat = neste
+        # Neste segment kan i sjeldne tilfeller (f.eks. "39/487 - 39/2011
+        # m.f. Begjæring om innsyn ...") SELV ha et gnr/bnr-prefiks som må
+        # strippes før _clean_adresse ser resten fra start - samme logikk
+        # som for segments[0] over.
+        neste_kandidat = _GNR_BNR_LIST_PREFIX.sub("", neste)
+        if neste_kandidat == neste:
+            neste_kandidat = _GNR_UKJENT_BNR_PREFIX.sub("", neste)
+        kandidat = neste_kandidat if neste_kandidat.strip() else neste
     return _clean_adresse(kandidat)
 
 

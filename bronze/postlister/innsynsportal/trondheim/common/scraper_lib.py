@@ -262,8 +262,13 @@ KILDER = {
 # (ikke bare de første to) fordi et fåtall titler skriver kommunenummeret
 # FØRST i kjeden ("5001/177/821/0/0" = KOMMUNE_NR/gnr/bnr/feste/seksjon, ikke
 # gnr/bnr 5001/177 - bekreftet på ekte data, se _gnr_bnr_fra_tallkjede).
+# Trigger-settet inkluderer også selve ordet "gnr/bnr"/"gbnr" (med evt.
+# kolon rett etter, "gnr/bnr: 410/488") som label foran tallkjeden - samme
+# fiks som Drammen fikk 2026-09-02 (se HANDOVER.md), lagt til her fordi
+# "gnr/bnr: 410/488, Bakke bru, tilsynssak" ikke ble fanget av noen av de
+# andre skilletegnene (kolon er ikke med i det opprinnelige settet).
 _TITLE_GNR_BNR = re.compile(
-    r"(?:^|[,\-(]|\beie(?:i)?ndom(?:men)?\s*\(?)\s*(\d{1,4}(?:/\d{1,5}){1,3})",
+    r"(?:^|[,\-(]|\beie(?:i)?ndom(?:men)?\s*\(?|\bgnr\s*/\s*bnr\.?:?|\bgbnr\.?:?)\s*(\d{1,4}(?:/\d{1,5}){1,3})",
     re.IGNORECASE,
 )
 
@@ -337,8 +342,66 @@ _BARE_LETTER_TOKEN = re.compile(r"^[A-Za-zæøåÆØÅ]$")
 # gatenavn + husnummer-token på slutten, med obligatorisk mellomrom foran
 # tallet (unngår å kutte midt i sammensatte sonekoder som "B2", "BB1")
 _STREET_AND_NUMBER_RANGE = re.compile(rf"^(.+?)\s+({TOKEN})$")
+# "Gatenavn N1/N2[/N3...]" - flere husnummer på samme gate skilt med
+# skråstrek i stedet for bindestrek/komma ("Harald Hårfagres gate 6/8") -
+# TOKEN over håndterer ALDRI skråstrek (kun bindestrek-spenn), så denne
+# konvensjonen falt tidligere alltid gjennom hele parseren og ga None,
+# uansett hvor riktig resten av tittelen så ut (bekreftet av bruker
+# 2026-09-02, samme mønster/fiks som Tromsø fikk samme dag - egen fil/kode
+# her, ikke delt, men strukturelt identisk siden begge bygger på samme
+# Trondheim-avledede parser). Holdt bevisst SEPARAT fra TOKEN (ikke slått
+# sammen): hvis skråstrek ble tillatt der òg, ville en senere komma-adskilt
+# bar matrikkelreferanse feilaktig blitt lest som en fortsettelse av samme
+# gate. Splitter til FLERE separate adresser (ikke ett spenn) - "6/8" ->
+# "6; 8", bekreftet ønsket av bruker.
+_TOKEN_SLASH = r"\d+[A-Za-zæøåÆØÅ]?(?:\s*/\s*\d+[A-Za-zæøåÆØÅ]?)+"
+_STREET_AND_NUMBER_SLASH = re.compile(rf"^(.+?)\s+({_TOKEN_SLASH})$")
+# "Gatenavn N BOKSTAV1 + BOKSTAV2[+ BOKSTAV3...]" - flere bokstav-suffikser
+# på SAMME husnummer skilt med "+" ("Nerviksvegen 28 A + B" -> "28A"/"28B" på
+# samme hus, "Kvernvegen 11 E+F" -> "11E"/"11F"; bekreftet av bruker
+# 2026-09-02). Skiller seg fra _TOKEN_SLASH over ved at det er ETT tall med
+# FLERE bokstav-suffiks, ikke flere ulike tall. KUN ett tegn (bokstav) tillatt
+# etter hver "+" (ikke et helt ord) - holder pattern'et fra å feilaktig matche
+# beskrivelsestekst som "5 etasjer + kjeller"/"kjede + eneboliger" (sjekket
+# mot alle 6 titler i arkivet som inneholder "+" - kun disse to var reelle
+# adressetilfeller, resten er beskrivelser eller allerede en gnr/bnr-liste
+# "28/7 + 28/3" som denne bevisst IKKE matcher siden det ikke er tall rett
+# etter "+" der).
+_TOKEN_PLUS = r"\d+[A-Za-zæøåÆØÅ]?(?:\s*\+\s*[A-Za-zæøåÆØÅ])+"
+_STREET_AND_NUMBER_PLUS = re.compile(rf"^(.+?)\s+({_TOKEN_PLUS})$")
+_PLUS_SPLIT = re.compile(r"\s*\+\s*")
+# Ord/uttrykk som kan stå rett foran et tallpar/tall men som signaliserer at
+# det IKKE er et gatenavn: journal-/matrikkel-sjargong ("eiendom(men/ene)"/
+# "eieindom(men)" - kjent skrivefeil i kilden - /"gnr"/"bnr"/"gnr/bnr"/"gbnr"/
+# "matrikkel(nr)"/"sak(snr/snummer)"/"byggesak") eller et prosjektnavn/
+# byggefase-referanse ("byggetrinn N" - "Grilstad Marina B3 byggetrinn 3"
+# er IKKE en adresse, bekreftet av bruker 2026-09-02; "Steinan Park
+# byggetrinn 2"/"Søknad om ramme for byggetrinn 3" lest som falske TILLEGGS-
+# adresser i en ellers riktig komma-liste, samme rotårsak). Regex (ikke et
+# enkelt sett) fordi disse forekommer med ulik tegnsetting i kildedata -
+# "gnr/bnr", "gnr./bnr.", "Gnr 24 Bnr 407" (mellomrom i stedet for skråstrek/
+# komma - fanges av _last_word siden hvert ord sjekkes for seg). Sjekkes mot
+# SISTE ord i "gatenavn"-kandidaten, uansett om den er det aller første
+# elementet eller en komma-/og-fortsettelse (ulikt Tromsøs tilsvarende vern,
+# som kun gjelder fortsettelser - her må også FØRSTE element sjekkes siden
+# "byggetrinn"-bugen og flere "Gnr X Bnr Y skrevet som adresse"-bugger
+# (bekreftet ekte, IKKE regresjoner - se full-korpus-verifisering 2026-09-02)
+# slår til nettopp der, se _parse_address_parts).
+_NON_ADDRESS_LAST_WORD = re.compile(
+    r"^(?:eie(?:i)?ndom(?:men|mer|mene)?|gnr\.?\s*/\s*bnr\.?|gbnr\.?|gnr\.?|bnr\.?|"
+    r"matrikkel(?:nr)?|sak(?:snr|snummer)?|byggesak|byggetrinn)$",
+    re.IGNORECASE,
+)
+# "Eiendommen ... har ikke adresse, <gnr>/<bnr>" (segment inneholder denne
+# frasen ET STED, ikke nødvendigvis som siste ord) er en eksplisitt uttalt
+# ikke-adresse etterfulgt av en matrikkelreferanse - IKKE det samme mønsteret
+# som _INGEN_ADRESSE over (som krever at STRENGEN STARTER med "ingen
+# adresse"), bekreftet på ekte data ("Eiendommen har ikke adresse 200/50" ble
+# feilaktig lest som to husnummer 200 og 50 før dette vernet).
+_HAR_IKKE_ADRESSE = re.compile(r"\bikke\s+adresse\b", re.IGNORECASE)
 _PART_SPLIT = re.compile(r"\s*(,|\bog\b)\s*")
 _STARTS_UPPER = re.compile(r"^[A-ZÆØÅ]")
+_STARTS_LETTER = re.compile(r"^[A-Za-zæøåÆØÅ]")
 
 
 def _normalize_nummer_bokstav(s):
@@ -377,6 +440,15 @@ def _truncate_at_separator_dash(seg):
     return left.strip()
 
 
+def _last_word(s):
+    """Siste "ord" i en gatenavn-kandidat, uten omsluttende tegnsetting (bl.a.
+    en åpen parentes foran, "(eiendommen" - forekommer ved et par ubalanserte
+    parenteser i kildedata) - brukt til å sjekke mot _NON_ADDRESS_LAST_WORD
+    (journal-/matrikkel-sjargong eller "byggetrinn")."""
+    word = re.sub(r"\W+$", "", s).rsplit(" ", 1)[-1]
+    return re.sub(r"^\W+", "", word).lower()
+
+
 def _parse_address_parts(s):
     """Tolker s som en liste av adresser atskilt med komma og/eller ' og '.
     Et bart tall/spenn arver gatenavnet fra forrige element, en bar bokstav
@@ -409,13 +481,69 @@ def _parse_address_parts(s):
             continue
         sm = _STREET_AND_NUMBER_RANGE.match(part)
         if sm and (sep is None or _STARTS_UPPER.match(sm.group(1).strip())):
-            current_street = sm.group(1).strip()
+            street_candidate = sm.group(1).strip()
+            # "byggetrinn N" (byggefase, ikke en gate) og "Gnr X Bnr Y"/
+            # "Eiendommen ... har ikke adresse N" (matrikkelreferanse skrevet
+            # med mellomrom i stedet for skråstrek, ser strukturelt ut som
+            # "gatenavn husnummer") kan begge dukke opp her - avvis uansett om
+            # dette er første element eller en fortsettelse, se
+            # _NON_ADDRESS_LAST_WORD/_HAR_IKKE_ADRESSE. Alle disse
+            # tilfellene ble bekreftet å IKKE være regresjoner (var allerede
+            # feilaktige/garblede adresser før denne sjekken ble lagt til -
+            # se full-korpus-verifisering 2026-09-02 i HANDOVER.md).
+            if (_NON_ADDRESS_LAST_WORD.match(_last_word(street_candidate))
+                    or _HAR_IKKE_ADRESSE.search(street_candidate)):
+                break
+            current_street = street_candidate
             norm = re.sub(r"\s*-\s*", "-", sm.group(2))
             entries.append(f"{current_street} {norm}")
             mnum = re.match(r"^(\d+)", norm)
             if mnum:
                 last_number = mnum.group(1)
             continue
+        sm_slash = _STREET_AND_NUMBER_SLASH.match(part)
+        if sm_slash and (sep is None or _STARTS_UPPER.match(sm_slash.group(1).strip())):
+            street_candidate = sm_slash.group(1).strip()
+            nums = [n.strip() for n in sm_slash.group(2).split("/")]
+            # Avvis: husnummer "0" (kildens placeholder, forekommer aldri i
+            # en ekte adresse); etikett+tallreferanse/"byggetrinn"/"har ikke
+            # adresse" foran tallparet; gatenavn-kandidater som selv starter
+            # med et TALL (aldri et ekte gatenavn - fanger opp rene
+            # tallkjede-referanser som "415/50og 415/62" der "og" er limt til
+            # forrige tall uten mellomrom, så det ikke matcher noe kjent
+            # skilletegn og ellers ville sett ut som et gatenavn); og
+            # gatenavn-kandidater som ender på en bar bindestrek ("Smelteverket
+            # 1 -" foran "415/178, dispensasjon..." - bindestreken hører til
+            # en ETTERFØLGENDE gnr/bnr-henvisning, ikke til gatenavnet, se
+            # "Smelteverket 1 - gnr/bnr 415/178" i samme datasett som bekrefter
+            # 415/178 er matrikkelnr, ikke husnummer).
+            if ("0" not in nums
+                    and not _NON_ADDRESS_LAST_WORD.match(_last_word(street_candidate))
+                    and not _HAR_IKKE_ADRESSE.search(street_candidate)
+                    and _STARTS_LETTER.match(street_candidate)
+                    and not street_candidate.endswith("-")):
+                current_street = street_candidate
+                for n in nums:
+                    entries.append(f"{current_street} {n}")
+                last_number = nums[-1]
+                continue
+        sm_plus = _STREET_AND_NUMBER_PLUS.match(part)
+        if sm_plus and (sep is None or _STARTS_UPPER.match(sm_plus.group(1).strip())):
+            street_candidate = sm_plus.group(1).strip()
+            units = _PLUS_SPLIT.split(sm_plus.group(2))
+            base_m = re.match(r"^(\d+)", units[0])
+            if (base_m
+                    and not _NON_ADDRESS_LAST_WORD.match(_last_word(street_candidate))
+                    and not _HAR_IKKE_ADRESSE.search(street_candidate)
+                    and _STARTS_LETTER.match(street_candidate)
+                    and not street_candidate.endswith("-")):
+                current_street = street_candidate
+                base_num = base_m.group(1)
+                entries.append(f"{current_street} {units[0]}")
+                for u in units[1:]:
+                    entries.append(f"{current_street} {base_num}{u}")
+                last_number = base_num
+                continue
         break
     seen = set()
     uniq = []
@@ -994,7 +1122,11 @@ def run_full_dump(kilde_key, output_file, start=None, end=None, save_every=30):
         print(f"OBS: {len(ukjent_sak)} journalposter hørte til saker utenfor "
               f"{start}..{end} og ble ikke tatt med (utenfor dumpens periode).")
 
-    upload_full_dump_til_azure(list(saker_by_id.values()), kilde_key)
+    # Azure-opplasting er BEVISST frakoblet her - kjør run_full_dump() rent
+    # lokalt (ingen forsøk på tilkobling). Funksjonen upload_full_dump_til_azure()
+    # står fortsatt klar og er uendret - kall den manuelt når Azure-tilgang er
+    # på plass.
+    # upload_full_dump_til_azure(list(saker_by_id.values()), kilde_key)
 
 
 # --------------------------------------------------------------------------- #

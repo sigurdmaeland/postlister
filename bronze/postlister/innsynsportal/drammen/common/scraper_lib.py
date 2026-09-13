@@ -258,14 +258,27 @@ def _portal_url(list_id):
 # --------------------------------------------------------------------------- #
 # For "bygg" (aktiv lista, adresse-først-tittel): fanger gnr/bnr[/feste/
 # seksjon] KUN når tallkjeden innledes av tittel-start, komma, bindestrek,
-# åpningsparentes eller "og" (dekker lister som "110/132, 110/531 og
-# 110/5010") - IKKE når det er del av et sakstall/referansenummer i parentes
+# åpningsparentes, "og", eller selve ordet "gbnr"/"gnr/bnr" (dekker lister
+# som "110/132, 110/531 og 110/5010", men også et fåtall titler som bryter
+# "adresse først"-konvensjonen og eksplisitt MERKER gnr/bnr-referansen, f.eks.
+# "Gbnr. 12/73. Øvre Bakkefeltet, ..." - uten "gbnr"/"gnr/bnr" som eget
+# utløserord ble disse liggende med gnr_bnr=null selv når propertyIdentifications
+# fra API-et også var tomt, bekreftet på ekte data 2026-09-02, se rapport/
+# HANDOVER.md) - IKKE når det er del av et sakstall/referansenummer i parentes
 # ("(ref. BYGG-19/00245)": "19" innledes riktignok av en bindestrek, men et
 # ekte gnr/bnr har ALDRI et bruksnummer med ledende null slik saksnummer-
 # sekvenser har - se _har_ledende_null). Hele tallkjeden fanges (ikke bare de
 # to første tallene) av samme grunn som Trondheim/Tromsø: et fåtall titler
-# kan skrive kommunenummeret først (se _gnr_bnr_fra_tallkjede).
-_TITLE_GNR_BNR = re.compile(r"(?:^|[,\-(]|\bog\b)\s*(\d{1,4}(?:/\d{1,5}){1,3})", re.IGNORECASE)
+# kan skrive kommunenummeret først (se _gnr_bnr_fra_tallkjede). NB: dette
+# fallbacket er rent ADDITIVT (se gnr_bnr_matrikkel) - det fjerner eller
+# overstyrer aldri en verdi som allerede kom fra propertyIdentifications,
+# selv om den skulle vise seg å være feil (samme kildesystem-usikkerhet som
+# er dokumentert for Asker) - det legger bare til det tittelen i tillegg
+# klart sier.
+_TITLE_GNR_BNR = re.compile(
+    r"(?:^|[,\-(]|\bog\b|\bgbnr\.?|\bgnr\s*/\s*bnr\.?)\s*(\d{1,4}(?:/\d{1,5}){1,3})",
+    re.IGNORECASE,
+)
 
 
 def _har_ledende_null(tall):
@@ -333,7 +346,12 @@ def gnr_bnr_matrikkel(property_identifications, tittel=None):
 _PARENS = re.compile(r"\s*\([^)]*\)")
 _MFL = re.compile(r"\bm\.?\s*fl\.?|\bmed flere\b", re.IGNORECASE)
 _NUM_LETTER_SPACE = re.compile(r"(\d+)\s+([A-Za-zæøåÆØÅ])\b")
-_TOKEN = r"\d+[A-Za-zæøåÆØÅ]?(?:\s*-\s*(?:\d+[A-Za-zæøåÆØÅ]?|[A-Za-zæøåÆØÅ]))?"
+# Husnummer-token: ett tall (+evt. bokstav-suffiks), evt. med EN ELLER FLERE
+# "-tall[bokstav]"-fortsettelser ("94-134", men også "22-24-26-28" - fire
+# adresser i én tittel, funnet ved gjennomgang av samtlige adresseløse
+# eByggesak-saker 2026-09-02, se rapport/HANDOVER.md - {0,} i stedet for det
+# opprinnelige {0,1} er den eneste endringen, strengt mer permissiv enn før).
+_TOKEN = r"\d+[A-Za-zæøåÆØÅ]?(?:\s*-\s*(?:\d+[A-Za-zæøåÆØÅ]?|[A-Za-zæøåÆØÅ])){0,}"
 _BARE_TOKEN_FULL = re.compile(rf"^{_TOKEN}$")
 _BARE_LETTER_TOKEN = re.compile(r"^[A-Za-zæøåÆØÅ]$")
 _STREET_AND_NUMBER_RANGE = re.compile(rf"^(.+?)\s+({_TOKEN})$")
@@ -346,6 +364,51 @@ _PAREN_CONTENT = re.compile(r"\(([^)]*)\)")
 # feilaktig HELE resten (inkl. selve adressen) som beskrivelse og forkaster
 # den (bekreftet på ekte data - se rapport).
 _LEADING_MATRIKKEL_DASH = re.compile(r"^\d+/\d+(?:/\d+){0,2}\s*-\s*")
+# Samme brudd på "adresse først", men med KOMMA i stedet for tankestrek som
+# skille ("333/34, Svelvikveien 1052, ...", evt. med "Gbnr."-merking eller to
+# gnr/bnr-par separert med "og") - funnet ved gjennomgang av samtlige 882
+# eByggesak-saker uten adresse 2026-09-02 (se rapport/HANDOVER.md), 27 av
+# disse hadde en fullt gjenkjennelig adresse rett etter dette prefikset.
+_LEADING_MATRIKKEL_COMMA = re.compile(
+    r"^(?:gbnr\.?\s*)?\d+/\d+(?:/\d+){0,2}(?:\s+og\s+\d+/\d+(?:/\d+){0,2})?\s*,\s*",
+    re.IGNORECASE,
+)
+# Plansaker ("Detaljregulering for X"/"Områderegulering for X", evt. med et
+# plan-ID-tall foran) har adressen EFTER dette prefikset, ikke i stedet for
+# det - uten stripping blir "Detaljregulering for " en del av selve
+# "adressen" (bekreftet på ekte data, f.eks. "Detaljregulering for
+# Dalenveien 32" i stedet for "Dalenveien 32" - se rapport). NB: dette er en
+# annen sakstype enn "Kommuneplanens arealdel" (se _LEADING_KOMMUNEPLAN
+# under) - en detalj-/områderegulering gjelder alltid en konkret
+# eiendom/adresse, mens en kommuneplan alltid gjelder HELE kommunen.
+_LEADING_PLAN_PREFIX = re.compile(
+    r"^(?:\d{4,10}\s+)?(?:detaljregulering|områderegulering)\s*(?:for\s+)?",
+    re.IGNORECASE,
+)
+# "Kommuneplanens arealdel for <kommune>" gjelder per definisjon HELE
+# kommunen, aldri en enkelteiendom - i motsetning til reguleringsplaner (se
+# _LEADING_PLAN_PREFIX over) er det derfor riktig å svare None her i stedet
+# for å prøve å lese ut noe som ser ut som en adresse (bekreftet på ekte
+# data: "20210007 Kommuneplanens arealdel for Drammen kommune 2023-2035"
+# ble tidligere feilaktig lest som om HELE denne teksten var adressen).
+_LEADING_KOMMUNEPLAN = re.compile(r"^(?:\d{4,10}\s+)?kommuneplan\w*\b", re.IGNORECASE)
+# En "gbnr NN/NN"-referanse midt i eller rett etter selve adressen (ikke
+# fremst, se _LEADING_MATRIKKEL_COMMA for det tilfellet) ødelegger
+# husnummer-treffet på slutten av segmentet ("Austadveien 77 A gbnr. 22/152"
+# - "22/152" har en skråstrek og matcher ikke _TOKEN, så HELE segmentet
+# feiler). Fjernes derfor uansett hvor den måtte stå i teksten (bekreftet på
+# ekte data 2026-09-02, se rapport/HANDOVER.md - referansen er uansett aldri
+# del av selve gateadressen).
+_EMBEDDED_GBNR = re.compile(r"\s*\bgbnr\.?\s*\d+/\d+(?:/\d+){0,2}", re.IGNORECASE)
+# Etter at et av prefiksene over er strippet av, er vi ikke lenger garantert
+# at det som følger faktisk ER adressen (selve grunnpremisset for at
+# _adresser_fra_tekst() stoler blindt på FØRSTE segment) - uten en ekstra
+# sjekk her plukket koden opp rein beskrivelsestekst som "adresse" i noen
+# tilfeller (f.eks. "etablering av telekommunikasjonsstolpe med høyde over
+# 5m" - "5m" så ut som et husnummer). Krever stor forbokstav, ELLER et
+# nummerert stedsnavn som ekte forekommer i Drammen ("1. Strøm terrasse 12",
+# "3. Bera terrasse 2B") - se rapport 2026-09-02.
+_LOOKS_LIKE_ADDRESS_START = re.compile(r"^(?:[A-ZÆØÅ]|\d+\.\s*[A-ZÆØÅ])")
 
 
 def _normalize_nummer_bokstav(s):
@@ -353,11 +416,18 @@ def _normalize_nummer_bokstav(s):
     return _NUM_LETTER_SPACE.sub(r"\1\2", s)
 
 
-def _adresser_fra_tekst(text):
+def _adresser_fra_tekst(text, trust_first=True):
     """Går segment for segment (delt på komma/' og ') og plukker opp
     husnummer så lenge de fortsetter forrige gatenavn (bart tall/bokstav)
     eller er et nytt "Gatenavn Nummer" (stor forbokstav kreves for å skille
-    fra beskrivelse). Stopper på første segment som er verken."""
+    fra beskrivelse). Stopper på første segment som er verken.
+
+    'trust_first' styrer om det ALLERFØRSTE segmentet stoles på uten
+    stor-forbokstav-sjekk (Drammens grunnkonvensjon: adressen står alltid
+    aller først) - sett til False av extract_adresse() når et
+    matrikkel-/plan-prefiks nettopp er strippet av, siden vi da ikke lenger
+    kan stole på at det som er igjen faktisk ER adressen (se
+    _LOOKS_LIKE_ADDRESS_START over)."""
     entries = []
     current_street = None
     last_number = None
@@ -365,7 +435,7 @@ def _adresser_fra_tekst(text):
     part0, seps_and_parts = tokens[0], tokens[1:]
     parts = [(None, part0)] + list(zip(seps_and_parts[0::2], seps_and_parts[1::2]))
 
-    for sep, part in parts:
+    for i, (sep, part) in enumerate(parts):
         part = part.strip()
         if not part:
             continue
@@ -384,7 +454,13 @@ def _adresser_fra_tekst(text):
                 last_number = mnum.group(1)
             continue
         sm = _STREET_AND_NUMBER_RANGE.match(_normalize_nummer_bokstav(part))
-        if sm and (sep is None or _STARTS_UPPER.match(sm.group(1).strip())):
+        if sm and i == 0:
+            gate_ok = True if trust_first else bool(_LOOKS_LIKE_ADDRESS_START.match(sm.group(1).strip()))
+        elif sm:
+            gate_ok = bool(_STARTS_UPPER.match(sm.group(1).strip()))
+        else:
+            gate_ok = False
+        if sm and gate_ok:
             current_street = sm.group(1).strip()
             norm = re.sub(r"\s*-\s*", "-", sm.group(2))
             entries.append(f"{current_street} {norm}")
@@ -411,22 +487,53 @@ def extract_adresse(tittel):
     (tilleggsinfo/saksreferanser) fjernes før oppdelingen, men prøves som
     fallback dersom hovedteksten ikke gir noen treff (adressen står
     unntaksvis inni parentesen, f.eks. "Eiendommen 209/6 (Drammensveien
-    151)"). Returnerer None hvis ikke noe gjenkjennelig husnummer finnes."""
+    151)"). Et fåtall titler bryter "adresse først" med et gnr/bnr- eller
+    plansaks-prefiks isteden (se _LEADING_MATRIKKEL_COMMA/_LEADING_PLAN_PREFIX)
+    - disse strippes før selve adresseutrekket, med strengere sjekk av
+    resultatet siden vi da ikke lenger har den vanlige garantien om at
+    adressen står helt fremst. "Kommuneplanens arealdel"-saker gjelder alltid
+    hele kommunen og gir aldri en adresse (_LEADING_KOMMUNEPLAN). Returnerer
+    None hvis ikke noe gjenkjennelig husnummer finnes."""
     if not tittel:
         return None
 
     text = _PARENS.sub("", tittel)
     text = _MFL.sub("", text)
+    # Noen titler har innledende mellomrom (" Gbnr. 39/32, ...") som ellers
+    # ville hindret prefiks-regexene under fra å treffe i det hele tatt siden
+    # de er forankret med "^" (fikset 2026-09-02, se HANDOVER.md).
+    text = text.strip()
+    if _LEADING_KOMMUNEPLAN.match(text):
+        return None
+    before = text
     text = _LEADING_MATRIKKEL_DASH.sub("", text)
+    # Løkke i stedet for ett enkelt .sub(): et fåtall titler har MER ENN to
+    # gnr/bnr-referanser komma-separert fremst ("10/144, 109/6011, Rødgata
+    # 25, ..." - _LEADING_MATRIKKEL_COMMA sin "og"-variant dekker kun TO,
+    # ikke en vilkårlig komma-liste) - kjør derfor gjentatte ganger til
+    # ingenting mer strippes (bekreftet på ekte data 2026-09-02, se
+    # HANDOVER.md).
+    while True:
+        stripped = _LEADING_MATRIKKEL_COMMA.sub("", text)
+        if stripped == text:
+            break
+        text = stripped
+    text = _LEADING_PLAN_PREFIX.sub("", text)
+    trust_first = (text == before)
+    # En "gbnr NN/NN"-referanse midt i teksten (ikke fremst - det er allerede
+    # dekket av _LEADING_MATRIKKEL_COMMA over) endrer ikke HVOR adressen
+    # starter, bare hva som står etter den, så dette påvirker bevisst ikke
+    # trust_first.
+    text = _EMBEDDED_GBNR.sub("", text)
     dash_idx = text.find(" - ")
     if dash_idx != -1:
         text = text[:dash_idx]
 
-    uniq = _adresser_fra_tekst(text)
+    uniq = _adresser_fra_tekst(text, trust_first=trust_first)
 
     if not uniq:
         for m in _PAREN_CONTENT.finditer(tittel):
-            uniq = _adresser_fra_tekst(m.group(1))
+            uniq = _adresser_fra_tekst(m.group(1), trust_first=trust_first)
             if uniq:
                 break
 
@@ -475,6 +582,16 @@ _DESCRIPTION_MARKERS_HIST = re.compile(
 # None her (referansenummeret er ikke en matrikkel), men adressen skal
 # fortsatt hentes ut.
 _REF_NUM_PREFIX = re.compile(r"^\d{3,8}\s*-\s*")
+# Et parentetisk innskudd midt i gnr/bnr-prefikset ("Gbnr. 42/534. (tidligere
+# 42/1), Stensetalleen 1, ...") blokkerer _GATE_NR helt siden den krever en
+# BOKSTAV som første tegn i det som er igjen etter prefikset - løses ved å
+# fjerne parenteser tidlig, slik extract_adresse() (den ikke-historiske
+# funksjonen) allerede gjør. Etterpå kan det stå igjen et par doble
+# skilletegn der parentesen var (f.eks. ".," når _GNR_SEP kun rekker å
+# konsumere det ene) - LEADING_JUNK_HIST fjerner ALLE slike før _GATE_NR
+# prøves (fikset 2026-09-02, se HANDOVER.md).
+_PARENS_HIST = re.compile(r"\s*\([^)]*\)")
+_LEADING_JUNK_HIST = re.compile(r"^[\s,.\-–:]+")
 
 
 def extract_adresse_hist(tittel):
@@ -496,6 +613,7 @@ def extract_adresse_hist(tittel):
     if not tittel:
         return None
     tekst = " ".join(tittel.split())
+    tekst = " ".join(_PARENS_HIST.sub("", tekst).split())
     m = _LABELED_GNR.match(tekst) or _BARE_GNR.match(tekst)
     if m:
         slutt = m.end()
@@ -519,11 +637,16 @@ def extract_adresse_hist(tittel):
         if not m_ref:
             return None
         slutt = m_ref.end()
-    rest = tekst[slutt:]
+    rest = _LEADING_JUNK_HIST.sub("", tekst[slutt:])
     m4 = _GATE_NR.match(rest)
     if not m4:
         return None
     candidate = re.sub(r"\s+", " ", m4.group(1)).strip(" .,-")
+    # Samme mellomrom-i-husnummer-suffiks-normalisering som extract_adresse()
+    # (den ikke-historiske funksjonen) allerede har - denne funksjonen mangla
+    # den, så "MØLLEVEIEN 3 B" ble aldri til "MØLLEVEIEN 3B" (fikset
+    # 2026-09-02, se HANDOVER.md).
+    candidate = _normalize_nummer_bokstav(candidate)
     if _REJECT_WORDS_HIST.search(candidate):
         return None
     if _DESCRIPTION_MARKERS_HIST.match(candidate):
