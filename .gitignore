@@ -37,6 +37,7 @@ desktop.ini
 # --- Scraper: testdata / lokal kjøring (ikke kode) ---
 **/output/*.json
 **/*_dump/**/*.json
+**/*_dump/**/*.jsonl
 **/running_daily/**/state.json
 **/running_daily/**/run.log
 **/running_daily/**/seen_journalpost_ids.json
